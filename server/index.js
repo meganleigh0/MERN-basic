@@ -11,7 +11,6 @@ app.use(cors());
 mongoose.connect(
   "mongodb+srv://Megan:Passw0rd!@cluster0.7mxbr.mongodb.net/myFirstDatabase?retryWrites=true&w=majority"
 );
-
 app.get("/getUsers", (req, res) => {
   UserModel.find({}, (err, result) => {
     if (err) {

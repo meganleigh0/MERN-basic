@@ -1,9 +1,7 @@
 **MERN-basic**
-Learning to create a full tech stack to build web applications. 
+Created the framework of a MERN (MongoDB, Express, React and NodeJS) stack
+The MERN architecture constructs a 3-tier architecture (frontend, backend, database) entirely using JavaScript and JSON.
 
-* Can only create one database in a project which is free
-* Used AWS as a cloud provider
 * Mongoose: library to make database queries and actions, communicate with the database in an easy manner
 * Cors: connection between React and backend
-* Nodemon: Devlop faster
-
+* Nodemon: Develop faster

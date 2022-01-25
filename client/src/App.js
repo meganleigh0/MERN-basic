@@ -1,9 +1,11 @@
 import "./App.css";
-import { useState, useEffect } from "react";
+import React,{ useState, useEffect } from "react";
 import Axios from "axios";
 
 function App() {
-  const [listOfUsers, setListOfUsers] = useState([]);
+  const [listOfUsers, setListOfUsers] = useState([
+    { id: 1, name: "Pedro", age: 22, username: "pedro123"},
+  ]);
   const [name, setName] = useState("");
   const [age, setAge] = useState(0);
   const [username, setUsername] = useState("");
@@ -44,6 +46,7 @@ function App() {
           );
         })}
       </div>
+
       <div>
         <input
           type="text"
