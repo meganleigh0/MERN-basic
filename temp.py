@@ -1,317 +1,198 @@
 """
-ClauseBot+ Starter EDA
-- Loads everything in your contracts data folder
-- Profiles Excel outputs (Results, Guidance, FAR/DFARS database)
-- Extracts text from PDF contract + Word user guide
-- Builds a first-pass “document chunks” table you can later use for diff/search/risk
+SOL: ClauseBot+ Starter (Fresh + Clear)
+What this does:
+1) Loads your 3 Excel files (Results, Guidance, FAR/DFARS database)
+2) Creates ONE clean master table: clauses_detected_enriched
+3) Creates a simple "risk features" starter table for NLP/ML
+4) Handles the reality that your contract PDF is scanned (no text) and shows what to do next
 
-Run this in a notebook cell. Update DATA_DIR to your folder.
+You can run this and immediately see:
+- what clauses were detected
+- what guidance exists
+- how to map to FAR/DFARS reference rows
+- what fields you can model on
 """
 
-from __future__ import annotations
-
-import re
-import json
 from pathlib import Path
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Optional
-
 import pandas as pd
+import re
 
 # ----------------------------
-# 0) CONFIG
+# A) CONFIG (change this)
 # ----------------------------
-DATA_DIR = Path(r"./CONTRACTS/data")  # <-- CHANGE THIS (e.g., r"C:\...\CONTRACTS\data")
-OUTPUT_DIR = DATA_DIR / "_eda_outputs"
-OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+DATA_DIR = Path(r"./CONTRACTS/data")  # <-- update path if needed
+
+RESULTS_XLSX  = DATA_DIR / "BSCA-65AC2-2544 (Executed) Results.xlsx"
+GUIDANCE_XLSX = DATA_DIR / "BSCA-65AC2-2544 (Executed) Guidance.xlsx"
+REF_XLSX      = DATA_DIR / "GDMS FAR_DFARS Database 03-12-2025.xlsx"
 
 pd.set_option("display.max_columns", 200)
 pd.set_option("display.width", 140)
 
 # ----------------------------
-# 1) UTILITIES
+# B) LOAD THE TABLES
 # ----------------------------
-def sniff_files(data_dir: Path) -> Dict[str, List[Path]]:
-    exts = {
-        "excel": [".xlsx", ".xlsm", ".xls"],
-        "pdf": [".pdf"],
-        "word": [".docx"],
-        "other": []
-    }
-    buckets = {k: [] for k in exts}
-    for p in data_dir.glob("*"):
-        if not p.is_file():
-            continue
-        suffix = p.suffix.lower()
-        matched = False
-        for k, suf_list in exts.items():
-            if suffix in suf_list:
-                buckets[k].append(p)
-                matched = True
-                break
-        if not matched:
-            buckets["other"].append(p)
-    return buckets
+results = pd.read_excel(RESULTS_XLSX, sheet_name="Sheet1")
+guid_raw = pd.read_excel(GUIDANCE_XLSX, sheet_name="Guidance.Raw")
+guid_nodup = pd.read_excel(GUIDANCE_XLSX, sheet_name="Guidance.Sort.NoDupes")
 
-def safe_read_excel_all_sheets(xlsx_path: Path) -> Dict[str, pd.DataFrame]:
-    """Read all sheets, lightly clean column names, return dict[sheet_name] = df."""
-    xls = pd.ExcelFile(xlsx_path)
-    out = {}
-    for sh in xls.sheet_names:
-        df = pd.read_excel(xlsx_path, sheet_name=sh)
-        df.columns = [str(c).strip() for c in df.columns]
-        out[sh] = df
-    return out
+far_ref = pd.read_excel(REF_XLSX, sheet_name="FAR_DATABASE")
+dfars_ref = pd.read_excel(REF_XLSX, sheet_name="DFARS_DATABASE")
+eff_thresholds = pd.read_excel(REF_XLSX, sheet_name="Effective Date- Thresholds")
 
-def profile_df(df: pd.DataFrame, name: str) -> Dict:
-    """Return a compact profile for quick EDA notes."""
-    prof = {
-        "name": name,
-        "shape": df.shape,
-        "columns": list(df.columns),
-        "dtypes": {c: str(df[c].dtype) for c in df.columns},
-        "nulls": df.isna().sum().sort_values(ascending=False).head(15).to_dict(),
-        "nunique": df.nunique(dropna=True).sort_values(ascending=False).head(15).to_dict(),
-        "sample_rows": df.head(5).to_dict(orient="records"),
-    }
-    return prof
+print("\n=== What files/tables you have ===")
+print(f"Results:  {results.shape}  (ClauseBot detected clauses for this contract)")
+print(f"Guidance Raw: {guid_raw.shape} (Guidance text per clause)")
+print(f"Guidance NoDupes: {guid_nodup.shape} (Same, cleaned)")
+print(f"FAR Reference:   {far_ref.shape} (Master FAR clause library)")
+print(f"DFARS Reference: {dfars_ref.shape} (Master DFARS clause library)")
+print(f"Effective thresholds: {eff_thresholds.shape} (Rules / thresholds used by reference)")
 
-def save_profile(profile: Dict, out_path: Path) -> None:
-    out_path.write_text(json.dumps(profile, indent=2, default=str), encoding="utf-8")
+print("\n=== First look: Results (top rows) ===")
+display(results.head(10))
 
-def extract_text_pdf(pdf_path: Path, max_pages: Optional[int] = None) -> str:
-    """
-    Try to extract PDF text. If it fails, returns empty string (scanned PDFs may need OCR).
-    Preferred: pdfplumber. Fallback: pypdf.
-    """
-    text_parts = []
-    # Attempt pdfplumber
-    try:
-        import pdfplumber  # pip install pdfplumber
-        with pdfplumber.open(str(pdf_path)) as pdf:
-            pages = pdf.pages[:max_pages] if max_pages else pdf.pages
-            for i, page in enumerate(pages):
-                t = page.extract_text() or ""
-                if t.strip():
-                    text_parts.append(t)
-        return "\n\n".join(text_parts).strip()
-    except Exception:
-        pass
-
-    # Fallback: pypdf
-    try:
-        from pypdf import PdfReader  # pip install pypdf
-        reader = PdfReader(str(pdf_path))
-        pages = reader.pages[:max_pages] if max_pages else reader.pages
-        for page in pages:
-            t = page.extract_text() or ""
-            if t.strip():
-                text_parts.append(t)
-        return "\n\n".join(text_parts).strip()
-    except Exception:
-        return ""
-
-def extract_text_docx(docx_path: Path) -> str:
-    """Extract text from .docx using python-docx."""
-    try:
-        from docx import Document  # pip install python-docx
-        doc = Document(str(docx_path))
-        paras = [p.text for p in doc.paragraphs if p.text and p.text.strip()]
-        return "\n".join(paras).strip()
-    except Exception:
-        return ""
-
-def normalize_whitespace(s: str) -> str:
-    s = s.replace("\r", "\n")
-    s = re.sub(r"[ \t]+", " ", s)
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
-
-def chunk_text(text: str, chunk_chars: int = 2000, overlap: int = 250) -> List[str]:
-    """
-    Simple chunker for early prototyping.
-    Later you can replace with:
-      - section/clause-based chunking
-      - sentence-based chunking
-    """
-    text = normalize_whitespace(text)
-    if not text:
-        return []
-    chunks = []
-    i = 0
-    n = len(text)
-    while i < n:
-        j = min(i + chunk_chars, n)
-        chunks.append(text[i:j])
-        i = j - overlap
-        if i < 0:
-            i = 0
-        if i >= n:
-            break
-    return chunks
-
-def find_clause_ids(text: str) -> List[str]:
-    """
-    Very loose FAR/DFARS clause ID pattern finder.
-    Your ClauseBot results will be more authoritative; this is just exploratory.
-    """
-    if not text:
-        return []
-    pat = re.compile(r"\b(?:FAR|DFARS)?\s*\d{2,3}\.\d{1,4}-\d{1,4}\b", re.IGNORECASE)
-    hits = pat.findall(text)
-    # normalize
-    cleaned = []
-    for h in hits:
-        h2 = re.sub(r"\s+", "", h.upper())
-        cleaned.append(h2)
-    return sorted(set(cleaned))
+print("\n=== First look: Guidance (top rows) ===")
+display(guid_nodup.head(10))
 
 # ----------------------------
-# 2) DISCOVER FILES
+# C) STANDARDIZE COLUMN NAMES (so joins are easier)
 # ----------------------------
-buckets = sniff_files(DATA_DIR)
-print("Found files:")
-for k, files in buckets.items():
-    print(f"- {k}: {len(files)}")
-    for f in files:
-        print(f"    {f.name}")
+def clean_cols(df):
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
 
-# ----------------------------
-# 3) LOAD & PROFILE EXCEL FILES
-# ----------------------------
-excel_books: Dict[str, Dict[str, pd.DataFrame]] = {}
-profiles: List[Dict] = []
+results = clean_cols(results)
+guid = clean_cols(guid_nodup)
+far_ref = clean_cols(far_ref)
+dfars_ref = clean_cols(dfars_ref)
 
-for xlsx in buckets["excel"]:
-    print(f"\nLoading Excel: {xlsx.name}")
-    sheets = safe_read_excel_all_sheets(xlsx)
-    excel_books[xlsx.name] = sheets
+# Identify likely clause id columns (we’ll be defensive because we don’t know exact names)
+def find_clause_col(df):
+    candidates = [c for c in df.columns if "clause" in c.lower()]
+    # Prefer ones that look like "Clause in Contract" or "Clause"
+    pref = [c for c in candidates if "contract" in c.lower()] + candidates
+    return pref[0] if pref else None
 
-    for sh, df in sheets.items():
-        nm = f"{xlsx.name} :: {sh}"
-        prof = profile_df(df, nm)
-        profiles.append(prof)
-        # save profile json
-        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", nm)[:180]
-        save_profile(prof, OUTPUT_DIR / f"profile__{safe_name}.json")
+results_clause_col = find_clause_col(results)
+guid_clause_col = find_clause_col(guid)
 
-print(f"\nSaved {len(profiles)} dataframe profile(s) to: {OUTPUT_DIR}")
-
-# Quick peek: list sheets + shapes
-print("\nExcel workbook summary:")
-for book, sheets in excel_books.items():
-    print(f"\n{book}")
-    for sh, df in sheets.items():
-        print(f"  - {sh}: shape={df.shape}")
+print("\n=== Detected key columns ===")
+print("Results clause column:", results_clause_col)
+print("Guidance clause column:", guid_clause_col)
 
 # ----------------------------
-# 4) EXTRACT TEXT FROM PDF CONTRACT + WORD USER GUIDE
+# D) NORMALIZE CLAUSE IDS
 # ----------------------------
-pdf_texts = {}
-for pdf in buckets["pdf"]:
-    print(f"\nExtracting PDF text: {pdf.name}")
-    txt = extract_text_pdf(pdf, max_pages=None)
-    pdf_texts[pdf.name] = txt
-    out_txt = OUTPUT_DIR / f"{pdf.stem}__extracted.txt"
-    out_txt.write_text(txt, encoding="utf-8")
-    print(f"  Extracted chars: {len(txt):,} (saved to {out_txt.name})")
-    if len(txt) < 1000:
-        print("  NOTE: Very little text extracted. This PDF might be scanned (needs OCR).")
+def normalize_clause_id(x):
+    if pd.isna(x): 
+        return None
+    s = str(x).strip().upper()
+    s = re.sub(r"\s+", " ", s)
 
-docx_texts = {}
-for docx in buckets["word"]:
-    print(f"\nExtracting DOCX text: {docx.name}")
-    txt = extract_text_docx(docx)
-    docx_texts[docx.name] = txt
-    out_txt = OUTPUT_DIR / f"{docx.stem}__extracted.txt"
-    out_txt.write_text(txt, encoding="utf-8")
-    print(f"  Extracted chars: {len(txt):,} (saved to {out_txt.name})")
+    # If it contains FAR/DFARS label, keep it
+    # Example patterns can vary; we keep the whole string but also create a numeric-ish token for matching
+    # e.g. "DFARS 252.227-7013" or "52.204-21" etc
+    s_compact = re.sub(r"\s+", "", s)  # remove spaces
+    return s, s_compact
+
+# Build normalized columns
+results["clause_raw"], results["clause_key"] = zip(*results[results_clause_col].map(normalize_clause_id))
+guid["clause_raw"], guid["clause_key"] = zip(*guid[guid_clause_col].map(normalize_clause_id))
 
 # ----------------------------
-# 5) BUILD A FIRST "DOCUMENT CHUNKS" TABLE (FOR SEARCH/DIFF LATER)
+# E) BUILD YOUR FIRST "MASTER" TABLE (this is the core dataset)
 # ----------------------------
-rows = []
-
-def add_doc_chunks(doc_name: str, raw_text: str, source_type: str):
-    chunks = chunk_text(raw_text, chunk_chars=2000, overlap=250)
-    clause_ids = find_clause_ids(raw_text)
-    for idx, ch in enumerate(chunks):
-        rows.append({
-            "doc_name": doc_name,
-            "source_type": source_type,
-            "chunk_index": idx,
-            "chunk_text": ch,
-            "chunk_len": len(ch),
-        })
-    return {
-        "doc_name": doc_name,
-        "source_type": source_type,
-        "n_chunks": len(chunks),
-        "total_chars": len(raw_text),
-        "approx_clause_ids_found": clause_ids[:30],  # show first 30
-        "approx_clause_id_count": len(clause_ids),
-    }
-
-doc_summaries = []
-for name, txt in pdf_texts.items():
-    doc_summaries.append(add_doc_chunks(name, txt, "pdf"))
-for name, txt in docx_texts.items():
-    doc_summaries.append(add_doc_chunks(name, txt, "docx"))
-
-chunks_df = pd.DataFrame(rows)
-summ_df = pd.DataFrame(doc_summaries)
-
-print("\nDocument summary:")
-display(summ_df)
-
-print("\nChunks preview:")
-display(chunks_df.head(10))
-
-# Save chunks to parquet/csv for next steps
-chunks_out = OUTPUT_DIR / "document_chunks.parquet"
-chunks_df.to_parquet(chunks_out, index=False)
-summ_out = OUTPUT_DIR / "document_summaries.csv"
-summ_df.to_csv(summ_out, index=False)
-print(f"\nSaved:\n- {chunks_out}\n- {summ_out}")
-
-# ----------------------------
-# 6) OPTIONAL: IDENTIFY KEY COLUMNS IN CLAUSEBOT OUTPUTS
-# ----------------------------
-def guess_clausebot_tables(excel_books: Dict[str, Dict[str, pd.DataFrame]]) -> Dict[str, List[Tuple[str, str]]]:
-    """
-    Heuristic: find tables likely containing 'clause' and 'dfars/far' references.
-    Returns dict[workbook] = list[(sheet_name, reason)]
-    """
-    hits = {}
-    for book, sheets in excel_books.items():
-        for sh, df in sheets.items():
-            cols = " ".join([c.lower() for c in df.columns])
-            reason = []
-            if "clause" in cols:
-                reason.append("has 'clause' column(s)")
-            if "far" in cols or "dfars" in cols:
-                reason.append("mentions FAR/DFARS")
-            if "guidance" in cols or "action" in cols or "recommend" in cols:
-                reason.append("looks like guidance/actions")
-            if reason:
-                hits.setdefault(book, []).append((sh, "; ".join(reason)))
-    return hits
-
-print("\nPossible ClauseBot-relevant sheets (heuristic):")
-hit_map = guess_clausebot_tables(excel_books)
-for book, items in hit_map.items():
-    print(f"\n{book}")
-    for sh, why in items:
-        print(f"  - {sh}: {why}")
-
-# ----------------------------
-# 7) NEXT STEP SUGGESTION (WHAT TO DO AFTER EDA)
-# ----------------------------
-print(
-    "\nNext steps after this EDA:\n"
-    "1) Confirm which Excel sheet is the authoritative ClauseBot Results table (clauses detected + locations).\n"
-    "2) Build a normalized 'clauses_detected' table: contract_id, clause_id, page/section, detected_text, confidence (if any).\n"
-    "3) Link clause_id to the FAR/DFARS database + guidance.\n"
-    "4) For contract comparison: align by clause_id, then add semantic similarity on detected_text/section text.\n"
-    "5) For risk search: build a risk taxonomy and run keyword + semantic retrieval over document_chunks.\n"
+# 1) Join detected clauses + guidance (same contract)
+clauses_detected = results.merge(
+    guid.drop(columns=[guid_clause_col]),  # keep one copy of original clause column
+    on="clause_key",
+    how="left",
+    suffixes=("_result", "_guid")
 )
+
+# 2) Attach FAR/DFARS reference (best-effort: we don’t know exact key columns there either)
+def build_ref(ref_df, source_name):
+    ref = ref_df.copy()
+    # find a clause-like column in the reference
+    ref_clause_col = find_clause_col(ref)
+    if ref_clause_col is None:
+        ref["ref_clause_key"] = None
+        return ref, None
+    ref["ref_clause_raw"], ref["ref_clause_key"] = zip(*ref[ref_clause_col].map(normalize_clause_id))
+    ref["ref_source"] = source_name
+    return ref, ref_clause_col
+
+far_ref2, far_ref_clause_col = build_ref(far_ref, "FAR")
+dfars_ref2, dfars_ref_clause_col = build_ref(dfars_ref, "DFARS")
+
+ref_all = pd.concat([far_ref2, dfars_ref2], ignore_index=True)
+
+# Join to reference
+clauses_detected_enriched = clauses_detected.merge(
+    ref_all.drop_duplicates(subset=["ref_clause_key"]),
+    left_on="clause_key",
+    right_on="ref_clause_key",
+    how="left"
+)
+
+print("\n=== ✅ MASTER TABLE: clauses_detected_enriched ===")
+print("Shape:", clauses_detected_enriched.shape)
+print("This is your ONE row per detected clause + guidance + FAR/DFARS reference match.")
+display(clauses_detected_enriched.head(20))
+
+# ----------------------------
+# F) CREATE A SIMPLE "RISK FEATURES" TABLE FOR NLP/ML
+# ----------------------------
+# This is not "AI magic" yet — it’s the clean features table you can model from.
+def simple_risk_category(clause_text: str) -> str:
+    if not clause_text:
+        return "unknown"
+    t = clause_text.lower()
+    if "data" in t or "rights" in t or "technical" in t:
+        return "ip/data_rights"
+    if "termination" in t or "default" in t:
+        return "termination"
+    if "inspection" in t or "acceptance" in t or "quality" in t:
+        return "quality/acceptance"
+    if "delivery" in t or "schedule" in t or "delay" in t:
+        return "schedule"
+    if "payment" in t or "invoice" in t or "price" in t:
+        return "payments/pricing"
+    return "general"
+
+# Try to pick a clause title-ish column from guidance or ref
+title_candidates = [c for c in clauses_detected_enriched.columns if "title" in c.lower()]
+title_col = title_candidates[0] if title_candidates else None
+
+risk_features = pd.DataFrame({
+    "contract_id": ["BSCA-65AC2-2544"] * len(clauses_detected_enriched),
+    "clause_key": clauses_detected_enriched["clause_key"],
+    "clause_raw": clauses_detected_enriched["clause_raw"],
+    "clause_title": clauses_detected_enriched[title_col] if title_col else None,
+    "flowdown_mandatory_flag": clauses_detected_enriched.get("Mandatory (M) or Optional (O) Flowdown", None),
+    "functional_accountability": clauses_detected_enriched.get("Functional Accountability", None),
+    "risk_bucket_guess": (clauses_detected_enriched[title_col].fillna("").map(simple_risk_category) if title_col else "unknown"),
+})
+
+print("\n=== Starter Risk Features Table (for ML/NLP) ===")
+display(risk_features)
+
+# Save clean outputs so you can reuse without reloading Excel every time
+OUT_DIR = DATA_DIR / "_clausebot_plus_outputs"
+OUT_DIR.mkdir(exist_ok=True)
+
+clauses_detected_enriched.to_csv(OUT_DIR / "clauses_detected_enriched.csv", index=False)
+risk_features.to_csv(OUT_DIR / "risk_features.csv", index=False)
+
+print(f"\nSaved:\n- {OUT_DIR / 'clauses_detected_enriched.csv'}\n- {OUT_DIR / 'risk_features.csv'}")
+
+# ----------------------------
+# G) IMPORTANT: Your PDF is scanned. That means no text to embed/diff/search yet.
+# What to do next:
+# 1) Get the original contract as Word OR text-based PDF if available
+# 2) Or run OCR (company-approved tool) to produce a searchable text layer
+# ----------------------------
+print("\n=== Next blocker to unlock NLP on the contract body ===")
+print("Your executed contract PDF appears scanned. For document-to-document comparison/search we need OCR text.")
+print("Once OCR exists, we'll create a 'contract_paragraphs' table and run embeddings + semantic diff + keyword risk scans.")
