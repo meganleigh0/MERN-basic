@@ -1,265 +1,500 @@
 import pandas as pd
 import numpy as np
 import re
+from pathlib import Path
+from datetime import datetime
 
-# -----------------------------
-# Accounting close dates
-# -----------------------------
-ACCT_CLOSE_DATES = pd.to_datetime([
-    "2026-01-04","2026-02-01","2026-03-01","2026-04-05","2026-05-03","2026-06-07",
-    "2026-07-05","2026-08-02","2026-09-06","2026-10-04","2026-11-01","2026-12-06"
-]).sort_values()
+# ============================================================
+# CONFIG
+# ============================================================
+DATA_DIR = Path("data")
+FILE_PREFIX = "cobra"  # case-insensitive
+SHEET_KEYWORDS = ["tbl", "weekly", "extract", "cap"]  # choose first matching sheet
+
+# Accounting closes (include both 2025 (from your screenshot) and 2026 (calendar image))
+# NOTE: update/add years as needed.
+ACCOUNTING_CLOSINGS = {
+    (2025, 1): 26, (2025, 2): 23, (2025, 3): 30, (2025, 4): 27, (2025, 5): 25, (2025, 6): 29,
+    (2025, 7): 27, (2025, 8): 24, (2025, 9): 28, (2025,10): 26, (2025,11): 23, (2025,12): 31,
+    (2026, 1): 4,  (2026, 2): 1,  (2026, 3): 1,  (2026, 4): 5,  (2026, 5): 3,  (2026, 6): 7,
+    (2026, 7): 5,  (2026, 8): 2,  (2026, 9): 6,  (2026,10): 4,  (2026,11): 1,  (2026,12): 6,
+}
+
+# ============================================================
+# Helpers
+# ============================================================
+def _clean_colname(c: str) -> str:
+    s = str(c).strip()
+    s = re.sub(r"\s+", "_", s)
+    s = re.sub(r"[^A-Za-z0-9_]", "", s)
+    return s.upper()
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    df.columns = [_clean_colname(c) for c in df.columns]
+    return df
 
 def safe_div(n, d):
-    n = n.astype(float); d = d.astype(float)
+    n = n.astype(float)
+    d = d.astype(float)
     return np.where(d != 0, n / d, np.nan)
 
-def norm_text(x):
-    if pd.isna(x): return ""
-    s = str(x).strip().lower()
-    s = re.sub(r"[^a-z0-9_ ]+", " ", s)
+def build_close_dates_from_dict(closing_dict: dict) -> pd.DatetimeIndex:
+    dates = []
+    for (y, m), day in closing_dict.items():
+        try:
+            dates.append(pd.Timestamp(datetime(y, m, day)))
+        except Exception:
+            pass
+    return pd.DatetimeIndex(sorted(set(dates)))
+
+ACCT_CLOSE_DATES = build_close_dates_from_dict(ACCOUNTING_CLOSINGS)
+
+def get_status_dates_from_data(max_date: pd.Timestamp):
+    """
+    Returns (curr_close, prev_close). If no close <= max_date, falls back to month-end logic.
+    """
+    if pd.isna(max_date):
+        return (pd.NaT, pd.NaT)
+    closes = ACCT_CLOSE_DATES[ACCT_CLOSE_DATES <= max_date]
+    if len(closes) >= 2:
+        return (closes[-1], closes[-2])
+    if len(closes) == 1:
+        return (closes[-1], closes[-1])
+    # fallback: month-end
+    me = pd.Timestamp(max_date).to_period("M").to_timestamp("M")
+    prev_me = (me - pd.offsets.MonthEnd(1))
+    return (me, prev_me)
+
+def best_sheet(path: Path):
+    """
+    Pick the best sheet based on keywords, otherwise first sheet.
+    """
+    xls = pd.ExcelFile(path)
+    sheets = xls.sheet_names
+    scored = []
+    for sh in sheets:
+        s = sh.lower()
+        score = sum(1 for k in SHEET_KEYWORDS if k in s)
+        scored.append((score, sh))
+    scored.sort(reverse=True, key=lambda t: t[0])
+    return scored[0][1] if scored else None
+
+def pick_value_column(df: pd.DataFrame) -> str:
+    """
+    Choose the numeric value column deterministically.
+    Prefer HOURS, then AMOUNT/COST/DOLLARS/VALUE variants.
+    """
+    cols = list(df.columns)
+    candidates = []
+    prefer_order = ["HOURS", "AMOUNT", "COST", "DOLLARS", "VALUE", "TOTAL"]
+    for p in prefer_order:
+        if p in cols:
+            candidates.append(p)
+    # add any numeric columns that look like value fields
+    for c in cols:
+        if c in candidates:
+            continue
+        if re.search(r"(HOUR|AMOUNT|COST|DOLLAR|VALUE|TOTAL)", c, re.I):
+            candidates.append(c)
+    # fallback: first numeric column
+    if not candidates:
+        num_cols = [c for c in cols if pd.api.types.is_numeric_dtype(df[c])]
+        if num_cols:
+            return num_cols[0]
+        # try coercion for all cols
+        for c in cols:
+            try:
+                pd.to_numeric(df[c].head(50), errors="raise")
+                return c
+            except Exception:
+                continue
+        raise ValueError("No numeric value column found.")
+    return candidates[0]
+
+# ============================================================
+# COST SET / METRIC NORMALIZATION
+# ============================================================
+# We categorize into:
+# FLOW metrics (sum monthly then cumsum): BCWS, BCWP, ACWP
+# STOCK metrics (last monthly then ffill): BAC, EAC, ETC
+# HOURS flow (sum monthly then cumsum + next month incremental): BCWS_HRS, ACWP_HRS, ETC_HRS
+
+FLOW_METRICS = {"BCWS", "BCWP", "ACWP", "BCWS_HRS", "ACWP_HRS", "ETC_HRS"}
+STOCK_METRICS = {"BAC", "EAC", "ETC"}  # dollar ETC is often stock-like; if yours is flow you can move it to FLOW
+
+def norm_cost_set(raw: str) -> str | None:
+    s = str(raw).strip().upper()
+    s = re.sub(r"[^A-Z0-9_ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return s
 
-# -----------------------------
-# COST-SET normalization
-# -----------------------------
-def norm_cost_set(raw):
-    s = norm_text(raw)
+    # Hours variants
+    if re.search(r"\bBCWS\b.*\b(HRS|HOURS)\b|\bBCWS_HRS\b|\bPLAN(HR|HRS|HOURS)\b", s):
+        return "BCWS_HRS"
+    if re.search(r"\bACWP\b.*\b(HRS|HOURS)\b|\bACWP_HRS\b|\bACHP_HRS\b|\bACTUAL(HR|HRS|HOURS)\b", s):
+        return "ACWP_HRS"
+    if re.search(r"\bETC\b.*\b(HRS|HOURS)\b|\bETC_HRS\b", s):
+        return "ETC_HRS"
 
-    # Explicit BAC exists in some exports
-    if s == "bac" or " budget at completion" in s:
+    # Explicit BAC/EAC/ETC
+    if re.search(r"\bBAC\b|BUDGET AT COMPLETION", s):
         return "BAC"
-
-    # Budget line (often time-phased baseline plan)
-    if "budget" in s:
-        return "BUDGET"
-
-    # Planned/Earned/Actual
-    if "bcws" in s or "planned value" in s:
-        return "BCWS"
-    if "bcwp" in s or "earned value" in s or "progress" in s:
-        return "BCWP"
-    if ("weekly actual" in s) or ("acwp" in s and ("wkl" in s or "week" in s)):
-        return "ACWP_FALLBACK"
-    if "acwp" in s or "actual cost" in s:
-        return "ACWP"
-
-    # Forecast
-    if "eac" in s:
+    if re.search(r"\bEAC\b|ESTIMATE AT COMPLETION", s):
         return "EAC"
-    if "etc" in s:
+    if re.search(r"\bETC\b|ESTIMATE TO COMPLETE|REMAINING|TO GO", s):
         return "ETC"
 
-    # Hours
-    if "acwp" in s and ("hrs" in s or "hour" in s):
-        return "ACT_HRS"
+    # Planned/Earned/Actual (dollars)
+    # BCWS synonyms: planned value, plan, schedule, budget (in some extracts "Budget" is PV not BAC)
+    if re.search(r"\bBCWS\b|PLANNED VALUE|\bPLAN\b|\bSCHEDULE\b", s):
+        return "BCWS"
+    if s == "BUDGET":  # ambiguous; treat as PV (BCWS) in these extracts
+        return "BCWS"
+
+    # BCWP synonyms: earned value, progress, perform
+    if re.search(r"\bBCWP\b|EARNED|PROGRESS|PERFORM", s):
+        return "BCWP"
+
+    # ACWP synonyms: actual cost, weekly actuals, ACWP_WKL
+    if re.search(r"\bACWP\b|ACTUAL COST|WEEKLY ACTUALS|ACWP_WKL|ACWP WKL", s):
+        return "ACWP"
 
     return None
 
-def last_close(d):
-    if pd.isna(d): return pd.NaT
-    closes = ACCT_CLOSE_DATES[ACCT_CLOSE_DATES <= d]
-    return closes.max() if len(closes) else pd.NaT
+# ============================================================
+# SERIES BUILDERS (this is the key fix vs the broken pipeline)
+# ============================================================
+def build_metric_series(group_df: pd.DataFrame, date_col: str, metric: str, value_col: str) -> pd.Series:
+    """
+    Returns a MONTH-END indexed series.
+    For FLOW metrics: monthly sum then cumsum (CTD series)
+    For STOCK metrics: monthly last then ffill (point-in-time)
+    """
+    g = group_df[group_df["METRIC"] == metric].copy()
+    if g.empty:
+        return pd.Series(dtype=float)
 
-def prior_close(cur):
-    if pd.isna(cur): return pd.NaT
-    idx = np.where(ACCT_CLOSE_DATES.values == np.datetime64(cur))[0]
-    if len(idx) == 0: return pd.NaT
-    i = int(idx[0])
-    return ACCT_CLOSE_DATES[i-1] if i > 0 else pd.NaT
+    g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
+    g = g.dropna(subset=[date_col])
+    if g.empty:
+        return pd.Series(dtype=float)
 
-def asof_sum(g, target_date, value_col):
-    # sum at latest DATE <= target_date; if no DATE, sum all
-    if g["DATE"].notna().any() and pd.notna(target_date):
-        gg = g[g["DATE"].notna()].sort_values("DATE")
-        gg = gg[gg["DATE"] <= target_date]
-        if gg.empty:
-            return np.nan
-        last_d = gg["DATE"].max()
-        return pd.to_numeric(gg.loc[gg["DATE"] == last_d, value_col], errors="coerce").fillna(0.0).sum()
-    return pd.to_numeric(g[value_col], errors="coerce").fillna(0.0).sum()
+    g["PERIOD_ME"] = g[date_col].dt.to_period("M").dt.to_timestamp("M")
+    g[value_col] = pd.to_numeric(g[value_col], errors="coerce").fillna(0.0)
 
-# -----------------------------
-# Build working df
-# -----------------------------
-df = cobra_df.copy()
+    if metric in FLOW_METRICS:
+        s = g.groupby("PERIOD_ME")[value_col].sum().sort_index()
+        return s.cumsum()
+    else:
+        # STOCK
+        s = g.sort_values(date_col).groupby("PERIOD_ME")[value_col].last().sort_index()
+        return s.ffill()
 
-req = {"source","SUB_TEAM","COST-SET","DATE"}
-missing = req - set(df.columns)
-if missing:
-    raise ValueError(f"Missing required columns: {missing}")
+def value_at(series: pd.Series, when: pd.Timestamp) -> float:
+    if series is None or series.empty or pd.isna(when):
+        return np.nan
+    when_me = pd.Timestamp(when).to_period("M").to_timestamp("M")
+    s = series[series.index <= when_me]
+    return float(s.iloc[-1]) if len(s) else np.nan
 
-df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-df["metric"] = df["COST-SET"].apply(norm_cost_set)
-df = df[df["metric"].notna()].copy()
+def monthly_increment_at(group_df: pd.DataFrame, date_col: str, metric: str, value_col: str, when: pd.Timestamp) -> float:
+    """
+    For NEXT MONTH metrics we want the monthly incremental, not cumulative.
+    """
+    g = group_df[group_df["METRIC"] == metric].copy()
+    if g.empty or pd.isna(when):
+        return np.nan
+    g[date_col] = pd.to_datetime(g[date_col], errors="coerce")
+    g = g.dropna(subset=[date_col])
+    if g.empty:
+        return np.nan
+    g["PERIOD_ME"] = g[date_col].dt.to_period("M").dt.to_timestamp("M")
+    g[value_col] = pd.to_numeric(g[value_col], errors="coerce").fillna(0.0)
+    s = g.groupby("PERIOD_ME")[value_col].sum().sort_index()  # incremental
+    when_me = pd.Timestamp(when).to_period("M").to_timestamp("M")
+    return float(s.get(when_me, np.nan))
 
-# Pick value column(s) by NAME (avoid numeric ID columns)
-preferred = [c for c in df.columns if re.search(r"(hours|amount|value|dollars|cost)", str(c), re.I)]
-preferred = [c for c in preferred if c.upper() not in {"CHG#", "CHG", "C CODE"}]
+# ============================================================
+# LOAD ALL COBRA FILES -> LONG FACT TABLE
+# ============================================================
+loaded = []
+pipeline_issues = []
 
-if not preferred:
-    # fallback: HOURS if present
-    preferred = [c for c in ["HOURS","AMOUNT","VALUE"] if c in df.columns]
-if not preferred:
-    raise ValueError("No usable value columns found (expected HOURS/AMOUNT/VALUE-like).")
+for path in DATA_DIR.glob("*.xlsx"):
+    if not path.name.lower().startswith(FILE_PREFIX.lower()):
+        continue
 
-# Use first preferred column as primary numeric value
-value_col = preferred[0]
-df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
+    try:
+        sh = best_sheet(path)
+        df = pd.read_excel(path, sheet_name=sh)
+        df = normalize_columns(df)
 
-# Some file types have values in a different column: coalesce across all preferred value columns
-vals = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in preferred], axis=1)
-df["VALUE"] = vals.bfill(axis=1).iloc[:,0].fillna(0.0)
+        # column harmonization
+        # Accept COST-SET variants
+        if "COST-SET" in df.columns and "COSTSET" not in df.columns:
+            df = df.rename(columns={"COST-SET": "COSTSET"})
+        if "COST_SET" in df.columns and "COSTSET" not in df.columns:
+            df = df.rename(columns={"COST_SET": "COSTSET"})
+        if "SUB_TEAM" not in df.columns:
+            # try common alternatives
+            for alt in ["SUBTEAM", "SUB_TEAM_", "RESP_DEPT", "RESPDEPT", "BE_DEPT", "BEDEPT"]:
+                if alt in df.columns:
+                    df = df.rename(columns={alt: "SUB_TEAM"})
+                    break
 
-print(f"✅ Using VALUE from columns (coalesced): {preferred}")
+        if "DATE" not in df.columns or "COSTSET" not in df.columns:
+            pipeline_issues.append((path.name, sh, "Missing DATE and/or COSTSET column"))
+            continue
 
-# -----------------------------
-# Snapshot / close dates per source
-# -----------------------------
-snap = df.groupby("source", as_index=False).agg(snapshot_date=("DATE","max"))
-snap["lsd_close_date"] = snap["snapshot_date"].apply(last_close)
-snap["prior_close_date"] = snap["lsd_close_date"].apply(prior_close)
-df = df.merge(snap, on="source", how="left")
+        # choose value column (deterministic)
+        val_col = pick_value_column(df)
+        df[val_col] = pd.to_numeric(df[val_col], errors="coerce")
 
-# -----------------------------
-# Fact table (CTD as-of snapshot; LSD = close delta)
-# -----------------------------
-records = []
-for (source, sub, m), g in df.groupby(["source","SUB_TEAM","metric"]):
-    snapshot_date = g["snapshot_date"].iloc[0]
-    close_date = g["lsd_close_date"].iloc[0]
-    prior_date = g["prior_close_date"].iloc[0]
+        # normalize metric
+        df["METRIC"] = df["COSTSET"].apply(norm_cost_set)
 
-    ctd = asof_sum(g, snapshot_date, "VALUE")
-    ctd_close = asof_sum(g, close_date, "VALUE")
-    ctd_prior = asof_sum(g, prior_date, "VALUE")
-    lsd = (ctd_close - ctd_prior) if (pd.notna(ctd_close) and pd.notna(ctd_prior)) else np.nan
+        # filter to rows we care about
+        df = df[df["METRIC"].notna()].copy()
+        if df.empty:
+            pipeline_issues.append((path.name, sh, "No recognized COSTSET values after mapping"))
+            continue
 
-    records.append({"source":source,"SUB_TEAM":sub,"metric":m,"CTD":ctd,"LSD":lsd})
+        # ensure subteam exists
+        if "SUB_TEAM" not in df.columns:
+            df["SUB_TEAM"] = "PROGRAM"
 
-fact = pd.DataFrame(records)
+        df["SOURCE"] = path.name
+        df["SOURCE_SHEET"] = sh
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+        df = df.dropna(subset=["DATE"])
 
-ctd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="CTD", aggfunc="sum", fill_value=np.nan).reset_index()
-lsd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="LSD", aggfunc="sum", fill_value=np.nan).reset_index()
+        # build long fact
+        fact = df[["SOURCE", "SOURCE_SHEET", "SUB_TEAM", "DATE", "METRIC", val_col]].copy()
+        fact = fact.rename(columns={val_col: "VALUE"})
+        fact["VALUE"] = pd.to_numeric(fact["VALUE"], errors="coerce").fillna(0.0)
 
-# Ensure columns exist (as NaN, not 0)
-for col in ["BAC","BUDGET","BCWS","BCWP","ACWP","ACWP_FALLBACK","EAC","ETC","ACT_HRS"]:
-    if col not in ctd.columns: ctd[col] = np.nan
-    if col not in lsd.columns: lsd[col] = np.nan
+        loaded.append(fact)
 
-# -----------------------------
-# BAC logic (robust + transparent)
-# -----------------------------
-# BAC candidate 1: explicit BAC (as-of snapshot)
-bac_explicit = ctd["BAC"]
+        print(f"✅ Loaded {path.name} → {sh} | value_col={val_col} | rows={len(fact):,}")
 
-# BAC candidate 2: if BUDGET is time-phased baseline, BAC = SUM of BUDGET across ALL dates (not as-of)
-bac_from_budget = (
-    df[df["metric"].eq("BUDGET")]
-    .groupby(["source","SUB_TEAM"], as_index=False)["VALUE"]
-    .sum()
-    .rename(columns={"VALUE":"BAC_from_budget"})
+    except Exception as e:
+        pipeline_issues.append((path.name, None, f"Load error: {e}"))
+
+cobra_fact = pd.concat(loaded, ignore_index=True) if loaded else pd.DataFrame(
+    columns=["SOURCE","SOURCE_SHEET","SUB_TEAM","DATE","METRIC","VALUE"]
 )
 
-ctd = ctd.merge(bac_from_budget, on=["source","SUB_TEAM"], how="left")
+# ============================================================
+# BUILD METRICS TABLES
+# ============================================================
+if cobra_fact.empty:
+    raise ValueError("cobra_fact is empty. Check pipeline_issues for load/mapping problems.")
 
-# Select BAC with provenance
-ctd["BAC_eff"] = np.where(ctd["BAC"].notna() & (ctd["BAC"] != 0), ctd["BAC"],
-                  np.where(ctd["BAC_from_budget"].notna() & (ctd["BAC_from_budget"] != 0), ctd["BAC_from_budget"], np.nan))
+# Snapshot dates per source
+snap = cobra_fact.groupby("SOURCE", as_index=False).agg(SNAPSHOT_DATE=("DATE","max"))
+snap["CURR_CLOSE"], snap["PREV_CLOSE"] = zip(*snap["SNAPSHOT_DATE"].apply(get_status_dates_from_data))
 
-ctd["BAC_source"] = np.where(ctd["BAC"].notna() & (ctd["BAC"] != 0), "explicit_BAC",
-                      np.where(ctd["BAC_from_budget"].notna() & (ctd["BAC_from_budget"] != 0), "sum(BUDGET)", "missing"))
+cobra_fact = cobra_fact.merge(snap, on="SOURCE", how="left")
 
-# -----------------------------
-# ACWP / BCWS fallbacks (still valid)
-# -----------------------------
-ctd["BCWS_eff"] = np.where(ctd["BCWS"].notna() & (ctd["BCWS"] != 0), ctd["BCWS"],
-                    np.where(ctd["BUDGET"].notna() & (ctd["BUDGET"] != 0), ctd["BUDGET"], np.nan))
-ctd["ACWP_eff"] = np.where(ctd["ACWP"].notna() & (ctd["ACWP"] != 0), ctd["ACWP"],
-                    np.where(ctd["ACWP_FALLBACK"].notna() & (ctd["ACWP_FALLBACK"] != 0), ctd["ACWP_FALLBACK"], np.nan))
-
-lsd["BCWS_eff"] = np.where(lsd["BCWS"].notna() & (lsd["BCWS"] != 0), lsd["BCWS"],
-                    np.where(lsd["BUDGET"].notna() & (lsd["BUDGET"] != 0), lsd["BUDGET"], np.nan))
-lsd["ACWP_eff"] = np.where(lsd["ACWP"].notna() & (lsd["ACWP"] != 0), lsd["ACWP"],
-                    np.where(lsd["ACWP_FALLBACK"].notna() & (lsd["ACWP_FALLBACK"] != 0), lsd["ACWP_FALLBACK"], np.nan))
-
-# -----------------------------
-# EAC logic (transparent)
-# -----------------------------
-# If EAC missing, we leave NaN by default.
-# Optional: compute a formula EAC = BAC_eff / CPI_CTD (ONLY if you want).
-ctd["EAC_eff"] = np.where(ctd["EAC"].notna() & (ctd["EAC"] != 0), ctd["EAC"], np.nan)
-ctd["EAC_source"] = np.where(ctd["EAC"].notna() & (ctd["EAC"] != 0), "explicit_EAC", "missing")
-
-# -----------------------------
-# Metrics
-# -----------------------------
-ctd["SPI_CTD"] = safe_div(ctd["BCWP"], ctd["BCWS_eff"])
-ctd["CPI_CTD"] = safe_div(ctd["BCWP"], ctd["ACWP_eff"])
-ctd["BEI_CTD"] = safe_div(ctd["BCWP"], ctd["BAC_eff"])
-ctd["VAC_CTD"] = ctd["BAC_eff"] - ctd["EAC_eff"]
-
-lsd["SPI_LSD"] = safe_div(lsd["BCWP"], lsd["BCWS_eff"])
-lsd["CPI_LSD"] = safe_div(lsd["BCWP"], lsd["ACWP_eff"])
-
-# -----------------------------
-# Output tables
-# -----------------------------
-source_evms_metrics = (
-    ctd.groupby("source", as_index=False)
-       .agg(BAC=("BAC_eff","sum"),
-            BCWS=("BCWS_eff","sum"),
-            BCWP=("BCWP","sum"),
-            ACWP=("ACWP_eff","sum"),
-            EAC=("EAC_eff","sum"))
-)
-source_evms_metrics["SPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["BCWS"])
-source_evms_metrics["CPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["ACWP"])
-source_evms_metrics["BEI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["BAC"])
-source_evms_metrics["VAC_CTD"] = source_evms_metrics["BAC"] - source_evms_metrics["EAC"]
-
-source_lsd = (
-    lsd.groupby("source", as_index=False)
-       .agg(BCWS=("BCWS_eff","sum"), BCWP=("BCWP","sum"), ACWP=("ACWP_eff","sum"))
-)
-source_lsd["SPI_LSD"] = safe_div(source_lsd["BCWP"], source_lsd["BCWS"])
-source_lsd["CPI_LSD"] = safe_div(source_lsd["BCWP"], source_lsd["ACWP"])
-source_evms_metrics = source_evms_metrics.merge(source_lsd[["source","SPI_LSD","CPI_LSD"]], on="source", how="left")
-
-subteam_metrics = (
-    ctd[["source","SUB_TEAM","SPI_CTD","CPI_CTD","BEI_CTD","BAC_eff","EAC_eff","VAC_CTD","BAC_source","EAC_source"]]
-    .rename(columns={"BAC_eff":"BAC","EAC_eff":"EAC"})
-    .merge(lsd[["source","SUB_TEAM","SPI_LSD","CPI_LSD"]], on=["source","SUB_TEAM"], how="left")
+# Audits
+label_audit = (
+    cobra_fact.groupby(["SOURCE","METRIC"], as_index=False).size()
+    .pivot_table(index="SOURCE", columns="METRIC", values="size", fill_value=0)
+    .reset_index()
 )
 
-subteam_cost = subteam_metrics[["source","SUB_TEAM","BAC","EAC","VAC_CTD","BAC_source","EAC_source"]].copy()
+# Compute per SOURCE + SUB_TEAM
+rows = []
+for (src, st), g in cobra_fact.groupby(["SOURCE","SUB_TEAM"]):
+    snapshot_date = g["SNAPSHOT_DATE"].iloc[0]
+    curr_close = g["CURR_CLOSE"].iloc[0]
+    prev_close = g["PREV_CLOSE"].iloc[0]
 
-hours_tbl = (
-    lsd[["source","SUB_TEAM","BCWS_eff","ACT_HRS","ETC"]]
-    .rename(columns={"BCWS_eff":"Demand_proxy","ACT_HRS":"Actual_Hours","ETC":"Next_Month_ETC_proxy"})
-)
-hours_tbl["Pct_Var"] = safe_div((hours_tbl["Actual_Hours"] - hours_tbl["Demand_proxy"]), hours_tbl["Demand_proxy"])
-hours_tbl["Next_Mo_BCWS_Hours"] = np.nan
+    # Build CTD series for flow metrics (cumsum) and stock metrics (ffill)
+    series = {}
+    for m in ["BCWS","BCWP","ACWP","BAC","EAC","ETC","BCWS_HRS","ACWP_HRS","ETC_HRS"]:
+        series[m] = build_metric_series(g, "DATE", m, "VALUE")
 
-# -----------------------------
-# Diagnostics: WHY BAC/EAC are missing
-# -----------------------------
-diag_bac_eac = (
-    subteam_cost.assign(
-        BAC_missing=lambda d: d["BAC"].isna(),
-        EAC_missing=lambda d: d["EAC"].isna()
+    # CTD values at snapshot
+    bcws_ctd = value_at(series["BCWS"], snapshot_date)
+    bcwp_ctd = value_at(series["BCWP"], snapshot_date)
+    acwp_ctd = value_at(series["ACWP"], snapshot_date)
+
+    # LSD values via close deltas on CTD series
+    bcws_lsd = value_at(series["BCWS"], curr_close) - value_at(series["BCWS"], prev_close)
+    bcwp_lsd = value_at(series["BCWP"], curr_close) - value_at(series["BCWP"], prev_close)
+    acwp_lsd = value_at(series["ACWP"], curr_close) - value_at(series["ACWP"], prev_close)
+
+    # BAC (prefer explicit BAC stock; else derive as max cumulative BCWS across entire baseline)
+    bac_explicit = value_at(series["BAC"], snapshot_date)
+    bac_method = "explicit_BAC" if pd.notna(bac_explicit) and bac_explicit != 0 else None
+
+    if bac_method is None:
+        # Derive BAC as max of cumulative BCWS (works when BCWS is baseline PV CTD)
+        bac_derived = float(series["BCWS"].max()) if (series["BCWS"] is not None and not series["BCWS"].empty) else np.nan
+        bac = bac_derived
+        bac_method = "derived_max_cum_BCWS" if pd.notna(bac_derived) and bac_derived != 0 else "missing"
+    else:
+        bac = bac_explicit
+
+    # EAC (prefer explicit EAC; else EAC = ACWP + ETC if ETC exists; else EAC = BAC / CPI if possible)
+    eac_explicit = value_at(series["EAC"], snapshot_date)
+    if pd.notna(eac_explicit) and eac_explicit != 0:
+        eac = eac_explicit
+        eac_method = "explicit_EAC"
+    else:
+        etc_stock = value_at(series["ETC"], snapshot_date)
+        if pd.notna(etc_stock) and etc_stock != 0 and pd.notna(acwp_ctd):
+            eac = acwp_ctd + etc_stock
+            eac_method = "derived_ACWP_plus_ETC"
+        else:
+            cpi_ctd = (bcwp_ctd / acwp_ctd) if (pd.notna(bcwp_ctd) and pd.notna(acwp_ctd) and acwp_ctd != 0) else np.nan
+            if pd.notna(bac) and bac != 0 and pd.notna(cpi_ctd) and cpi_ctd != 0:
+                eac = bac / cpi_ctd
+                eac_method = "derived_BAC_div_CPI"
+            else:
+                eac = np.nan
+                eac_method = "missing"
+
+    vac_ctd = bac - eac if (pd.notna(bac) and pd.notna(eac)) else np.nan
+
+    spi_ctd = (bcwp_ctd / bcws_ctd) if (pd.notna(bcwp_ctd) and pd.notna(bcws_ctd) and bcws_ctd != 0) else np.nan
+    cpi_ctd = (bcwp_ctd / acwp_ctd) if (pd.notna(bcwp_ctd) and pd.notna(acwp_ctd) and acwp_ctd != 0) else np.nan
+    spi_lsd = (bcwp_lsd / bcws_lsd) if (pd.notna(bcwp_lsd) and pd.notna(bcws_lsd) and bcws_lsd != 0) else np.nan
+    cpi_lsd = (bcwp_lsd / acwp_lsd) if (pd.notna(bcwp_lsd) and pd.notna(acwp_lsd) and acwp_lsd != 0) else np.nan
+
+    bei_ctd = (bcwp_ctd / bac) if (pd.notna(bcwp_ctd) and pd.notna(bac) and bac != 0) else np.nan
+
+    # Hours metrics (monthly incremental for next month + CTD from cumsum)
+    # Demand Hours = BCWS_HRS LSD (current close period increment)
+    demand_hrs = value_at(series["BCWS_HRS"], curr_close) - value_at(series["BCWS_HRS"], prev_close) if (not series["BCWS_HRS"].empty) else np.nan
+    actual_hrs = value_at(series["ACWP_HRS"], curr_close) - value_at(series["ACWP_HRS"], prev_close) if (not series["ACWP_HRS"].empty) else np.nan
+
+    pct_var = ((actual_hrs - demand_hrs) / demand_hrs) if (pd.notna(actual_hrs) and pd.notna(demand_hrs) and demand_hrs != 0) else np.nan
+
+    next_month = (pd.Timestamp(curr_close).to_period("M") + 1).to_timestamp("M") if pd.notna(curr_close) else pd.NaT
+    next_mo_bcws_hrs = monthly_increment_at(g, "DATE", "BCWS_HRS", "VALUE", next_month)
+    next_mo_etc_hrs = monthly_increment_at(g, "DATE", "ETC_HRS", "VALUE", next_month)
+
+    rows.append({
+        "SOURCE": src,
+        "SUB_TEAM": st,
+        "SNAPSHOT_DATE": snapshot_date,
+        "CURR_CLOSE": curr_close,
+        "PREV_CLOSE": prev_close,
+
+        "BCWS_CTD": bcws_ctd,
+        "BCWP_CTD": bcwp_ctd,
+        "ACWP_CTD": acwp_ctd,
+        "SPI_CTD": spi_ctd,
+        "CPI_CTD": cpi_ctd,
+        "BEI_CTD": bei_ctd,
+
+        "BCWS_LSD": bcws_lsd,
+        "BCWP_LSD": bcwp_lsd,
+        "ACWP_LSD": acwp_lsd,
+        "SPI_LSD": spi_lsd,
+        "CPI_LSD": cpi_lsd,
+
+        "BAC": bac,
+        "BAC_METHOD": bac_method,
+        "EAC": eac,
+        "EAC_METHOD": eac_method,
+        "VAC_CTD": vac_ctd,
+
+        "Demand_Hours": demand_hrs,
+        "Actual_Hours": actual_hrs,
+        "Pct_Var": pct_var,
+        "Next_Mo_BCWS_Hours": next_mo_bcws_hrs,
+        "Next_Mo_ETC_Hours": next_mo_etc_hrs
+    })
+
+subteam_metrics = pd.DataFrame(rows)
+
+# Program-level rollup (SOURCE only)
+program_metrics = (
+    subteam_metrics.groupby("SOURCE", as_index=False)
+    .agg(
+        SNAPSHOT_DATE=("SNAPSHOT_DATE","max"),
+        CURR_CLOSE=("CURR_CLOSE","max"),
+        PREV_CLOSE=("PREV_CLOSE","max"),
+        BCWS_CTD=("BCWS_CTD","sum"),
+        BCWP_CTD=("BCWP_CTD","sum"),
+        ACWP_CTD=("ACWP_CTD","sum"),
+        BAC=("BAC","sum"),
+        EAC=("EAC","sum"),
+        VAC_CTD=("VAC_CTD","sum"),
+        BCWS_LSD=("BCWS_LSD","sum"),
+        BCWP_LSD=("BCWP_LSD","sum"),
+        ACWP_LSD=("ACWP_LSD","sum"),
+        Demand_Hours=("Demand_Hours","sum"),
+        Actual_Hours=("Actual_Hours","sum"),
+        Next_Mo_BCWS_Hours=("Next_Mo_BCWS_Hours","sum"),
+        Next_Mo_ETC_Hours=("Next_Mo_ETC_Hours","sum"),
     )
-    .groupby("source", as_index=False)
+)
+
+program_metrics["SPI_CTD"] = safe_div(program_metrics["BCWP_CTD"], program_metrics["BCWS_CTD"])
+program_metrics["CPI_CTD"] = safe_div(program_metrics["BCWP_CTD"], program_metrics["ACWP_CTD"])
+program_metrics["BEI_CTD"] = safe_div(program_metrics["BCWP_CTD"], program_metrics["BAC"])
+program_metrics["SPI_LSD"] = safe_div(program_metrics["BCWP_LSD"], program_metrics["BCWS_LSD"])
+program_metrics["CPI_LSD"] = safe_div(program_metrics["BCWP_LSD"], program_metrics["ACWP_LSD"])
+program_metrics["Pct_Var"] = safe_div(program_metrics["Actual_Hours"] - program_metrics["Demand_Hours"], program_metrics["Demand_Hours"])
+
+# Cost-only table
+subteam_cost = subteam_metrics[["SOURCE","SUB_TEAM","BAC","BAC_METHOD","EAC","EAC_METHOD","VAC_CTD"]].copy()
+
+# Hours-only table
+hours_metrics = subteam_metrics[[
+    "SOURCE","SUB_TEAM","SNAPSHOT_DATE","CURR_CLOSE",
+    "Demand_Hours","Actual_Hours","Pct_Var","Next_Mo_BCWS_Hours","Next_Mo_ETC_Hours"
+]].copy()
+
+# Coverage audit: where are things missing and why
+coverage_audit = (
+    subteam_metrics.assign(
+        BCWS_missing=lambda d: d["BCWS_CTD"].isna() | (d["BCWS_CTD"]==0),
+        ACWP_missing=lambda d: d["ACWP_CTD"].isna() | (d["ACWP_CTD"]==0),
+        BAC_missing=lambda d: d["BAC"].isna() | (d["BAC"]==0),
+        EAC_missing=lambda d: d["EAC"].isna() | (d["EAC"]==0),
+    )
+    .groupby("SOURCE", as_index=False)
     .agg(
         rows=("SUB_TEAM","count"),
+        pct_BCWS_missing=("BCWS_missing","mean"),
+        pct_ACWP_missing=("ACWP_missing","mean"),
         pct_BAC_missing=("BAC_missing","mean"),
-        pct_EAC_missing=("EAC_missing","mean")
+        pct_EAC_missing=("EAC_missing","mean"),
     )
-    .sort_values(["pct_BAC_missing","pct_EAC_missing"], ascending=False)
+    .sort_values(["pct_BCWS_missing","pct_ACWP_missing","pct_BAC_missing","pct_EAC_missing"], ascending=False)
 )
 
-print("✅ Created: source_evms_metrics, subteam_metrics, subteam_cost, hours_tbl")
-print("\n--- BAC/EAC missing diagnostics (top 15) ---")
-print(diag_bac_eac.head(15))
-print("\nTip: filter subteam_cost where BAC_source=='missing' or EAC_source=='missing' to see which file types don't carry those metrics.")
+print("\n✅ Pipeline outputs created:")
+print(" - cobra_fact (long fact)")
+print(" - program_metrics (per program/source)")
+print(" - subteam_metrics (per program/source + subteam)")
+print(" - subteam_cost (BAC/EAC/VAC)")
+print(" - hours_metrics (Demand/Actual/%Var/Next month)")
+print(" - label_audit, coverage_audit, pipeline_issues")
+
+print("\n--- Top coverage issues (sources with most missing) ---")
+print(coverage_audit.head(15))
+
+if pipeline_issues:
+    print("\n--- Load/mapping issues ---")
+    for it in pipeline_issues[:25]:
+        print(" -", it)
+
+# ============================================================
+# OPTIONAL: Write all tables to ONE Excel for Power BI
+# ============================================================
+# out_path = DATA_DIR / "cobra_evms_tables.xlsx"
+# with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+#     cobra_fact.to_excel(writer, sheet_name="fact_long", index=False)
+#     program_metrics.to_excel(writer, sheet_name="program_metrics", index=False)
+#     subteam_metrics.to_excel(writer, sheet_name="subteam_metrics", index=False)
+#     subteam_cost.to_excel(writer, sheet_name="subteam_cost", index=False)
+#     hours_metrics.to_excel(writer, sheet_name="hours_metrics", index=False)
+#     label_audit.to_excel(writer, sheet_name="label_audit", index=False)
+#     coverage_audit.to_excel(writer, sheet_name="coverage_audit", index=False)
+# print(f"\n✅ Wrote: {out_path}")
