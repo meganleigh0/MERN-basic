@@ -2,17 +2,14 @@ import pandas as pd
 import numpy as np
 import re
 
-# ============================================================
-# 0) CONFIG — 2026 Accounting Period Close Dates
-# ============================================================
+# -----------------------------
+# Accounting close dates
+# -----------------------------
 ACCT_CLOSE_DATES = pd.to_datetime([
     "2026-01-04","2026-02-01","2026-03-01","2026-04-05","2026-05-03","2026-06-07",
     "2026-07-05","2026-08-02","2026-09-06","2026-10-04","2026-11-01","2026-12-06"
 ]).sort_values()
 
-# ============================================================
-# 1) Helpers
-# ============================================================
 def safe_div(n, d):
     n = n.astype(float); d = d.astype(float)
     return np.where(d != 0, n / d, np.nan)
@@ -24,30 +21,37 @@ def norm_text(x):
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
+# -----------------------------
+# COST-SET normalization
+# -----------------------------
 def norm_cost_set(raw):
     s = norm_text(raw)
 
-    # NOTE: "Budget" is often PV (BCWS) in these extracts
-    if "budget" in s:
-        return "BUDGET_PV"
-    if "progress" in s or "earned value" in s or "bcwp" in s:
-        return "BCWP"
-    if "planned value" in s or "bcws" in s:
-        return "BCWS"
+    # Explicit BAC exists in some exports
+    if s == "bac" or " budget at completion" in s:
+        return "BAC"
 
-    # Actuals can appear multiple ways
+    # Budget line (often time-phased baseline plan)
+    if "budget" in s:
+        return "BUDGET"
+
+    # Planned/Earned/Actual
+    if "bcws" in s or "planned value" in s:
+        return "BCWS"
+    if "bcwp" in s or "earned value" in s or "progress" in s:
+        return "BCWP"
     if ("weekly actual" in s) or ("acwp" in s and ("wkl" in s or "week" in s)):
         return "ACWP_FALLBACK"
     if "acwp" in s or "actual cost" in s:
         return "ACWP"
 
-    # Forecast buckets
+    # Forecast
     if "eac" in s:
         return "EAC"
     if "etc" in s:
         return "ETC"
 
-    # Hours actuals (keep separate)
+    # Hours
     if "acwp" in s and ("hrs" in s or "hour" in s):
         return "ACT_HRS"
 
@@ -71,63 +75,58 @@ def asof_sum(g, target_date, value_col):
         gg = g[g["DATE"].notna()].sort_values("DATE")
         gg = gg[gg["DATE"] <= target_date]
         if gg.empty:
-            return 0.0
+            return np.nan
         last_d = gg["DATE"].max()
-        return gg.loc[gg["DATE"] == last_d, value_col].sum()
-    return g[value_col].sum()
+        return pd.to_numeric(gg.loc[gg["DATE"] == last_d, value_col], errors="coerce").fillna(0.0).sum()
+    return pd.to_numeric(g[value_col], errors="coerce").fillna(0.0).sum()
 
-# ============================================================
-# 2) Build df + robust VALUE (coalesce numeric columns row-wise)
-# ============================================================
+# -----------------------------
+# Build working df
+# -----------------------------
 df = cobra_df.copy()
 
-need = {"source","SUB_TEAM","COST-SET","DATE"}
-missing = need - set(df.columns)
+req = {"source","SUB_TEAM","COST-SET","DATE"}
+missing = req - set(df.columns)
 if missing:
     raise ValueError(f"Missing required columns: {missing}")
 
 df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-df["cost_set_norm"] = df["COST-SET"].apply(norm_cost_set)
-df = df[df["cost_set_norm"].notna()].copy()
+df["metric"] = df["COST-SET"].apply(norm_cost_set)
+df = df[df["metric"].notna()].copy()
 
-# Candidate numeric columns (different file types store values differently)
-exclude = {"DATE"}
-cands = []
-for c in df.columns:
-    if c in exclude: 
-        continue
-    if pd.api.types.is_numeric_dtype(df[c]):
-        cands.append(c)
-# also include common named numeric columns even if imported as object
-for c in ["HOURS","AMOUNT","VALUE","DOLLARS","COST","TOTAL"]:
-    if c in df.columns and c not in cands:
-        cands.append(c)
+# Pick value column(s) by NAME (avoid numeric ID columns)
+preferred = [c for c in df.columns if re.search(r"(hours|amount|value|dollars|cost)", str(c), re.I)]
+preferred = [c for c in preferred if c.upper() not in {"CHG#", "CHG", "C CODE"}]
 
-if not cands:
-    raise ValueError("No numeric columns found to compute VALUE.")
+if not preferred:
+    # fallback: HOURS if present
+    preferred = [c for c in ["HOURS","AMOUNT","VALUE"] if c in df.columns]
+if not preferred:
+    raise ValueError("No usable value columns found (expected HOURS/AMOUNT/VALUE-like).")
 
-# Coalesce numeric columns row-wise: take the max absolute numeric as the VALUE
-# (works when some columns are blank for certain cost sets)
-cand_numeric = []
-for c in cands:
-    cand_numeric.append(pd.to_numeric(df[c], errors="coerce"))
-vals = pd.concat(cand_numeric, axis=1)
-df["VALUE"] = vals.fillna(0.0).abs().max(axis=1) * np.sign(vals.fillna(0.0).sum(axis=1).replace(0, 1))
-df["VALUE"] = df["VALUE"].fillna(0.0)
+# Use first preferred column as primary numeric value
+value_col = preferred[0]
+df[value_col] = pd.to_numeric(df[value_col], errors="coerce")
 
-# ============================================================
-# 3) Snapshot + accounting close dates per source
-# ============================================================
+# Some file types have values in a different column: coalesce across all preferred value columns
+vals = pd.concat([pd.to_numeric(df[c], errors="coerce") for c in preferred], axis=1)
+df["VALUE"] = vals.bfill(axis=1).iloc[:,0].fillna(0.0)
+
+print(f"✅ Using VALUE from columns (coalesced): {preferred}")
+
+# -----------------------------
+# Snapshot / close dates per source
+# -----------------------------
 snap = df.groupby("source", as_index=False).agg(snapshot_date=("DATE","max"))
 snap["lsd_close_date"] = snap["snapshot_date"].apply(last_close)
 snap["prior_close_date"] = snap["lsd_close_date"].apply(prior_close)
 df = df.merge(snap, on="source", how="left")
 
-# ============================================================
-# 4) Compute CTD as-of snapshot; LSD via close deltas
-# ============================================================
+# -----------------------------
+# Fact table (CTD as-of snapshot; LSD = close delta)
+# -----------------------------
 records = []
-for (source, sub, cs), g in df.groupby(["source","SUB_TEAM","cost_set_norm"]):
+for (source, sub, m), g in df.groupby(["source","SUB_TEAM","metric"]):
     snapshot_date = g["snapshot_date"].iloc[0]
     close_date = g["lsd_close_date"].iloc[0]
     prior_date = g["prior_close_date"].iloc[0]
@@ -135,67 +134,85 @@ for (source, sub, cs), g in df.groupby(["source","SUB_TEAM","cost_set_norm"]):
     ctd = asof_sum(g, snapshot_date, "VALUE")
     ctd_close = asof_sum(g, close_date, "VALUE")
     ctd_prior = asof_sum(g, prior_date, "VALUE")
-    lsd = ctd_close - ctd_prior
+    lsd = (ctd_close - ctd_prior) if (pd.notna(ctd_close) and pd.notna(ctd_prior)) else np.nan
 
-    records.append({
-        "source": source, "SUB_TEAM": sub, "metric": cs,
-        "CTD": ctd, "LSD": lsd
-    })
+    records.append({"source":source,"SUB_TEAM":sub,"metric":m,"CTD":ctd,"LSD":lsd})
 
 fact = pd.DataFrame(records)
 
-ctd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="CTD", aggfunc="sum", fill_value=0.0).reset_index()
-lsd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="LSD", aggfunc="sum", fill_value=0.0).reset_index()
+ctd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="CTD", aggfunc="sum", fill_value=np.nan).reset_index()
+lsd = fact.pivot_table(index=["source","SUB_TEAM"], columns="metric", values="LSD", aggfunc="sum", fill_value=np.nan).reset_index()
 
-# Ensure expected columns exist
-for col in ["BCWS","BCWP","ACWP","ACWP_FALLBACK","BUDGET_PV","EAC","ETC","ACT_HRS"]:
-    if col not in ctd.columns: ctd[col] = 0.0
-    if col not in lsd.columns: lsd[col] = 0.0
+# Ensure columns exist (as NaN, not 0)
+for col in ["BAC","BUDGET","BCWS","BCWP","ACWP","ACWP_FALLBACK","EAC","ETC","ACT_HRS"]:
+    if col not in ctd.columns: ctd[col] = np.nan
+    if col not in lsd.columns: lsd[col] = np.nan
 
-# ============================================================
-# 5) Reconciliation logic per file type
-#    - BCWS = BCWS if present else BUDGET_PV
-#    - ACWP = ACWP if present else ACWP_FALLBACK
-#    - BAC  = total baseline = SUM(BUDGET_PV across all dates)  (use CTD(BUDGET_PV_total))
-# ============================================================
-# BAC derivation: total baseline budget = sum of BUDGET_PV over all dates (NOT as-of)
-bac_total = (
-    df[df["cost_set_norm"].eq("BUDGET_PV")]
+# -----------------------------
+# BAC logic (robust + transparent)
+# -----------------------------
+# BAC candidate 1: explicit BAC (as-of snapshot)
+bac_explicit = ctd["BAC"]
+
+# BAC candidate 2: if BUDGET is time-phased baseline, BAC = SUM of BUDGET across ALL dates (not as-of)
+bac_from_budget = (
+    df[df["metric"].eq("BUDGET")]
     .groupby(["source","SUB_TEAM"], as_index=False)["VALUE"]
     .sum()
-    .rename(columns={"VALUE":"BAC"})
+    .rename(columns={"VALUE":"BAC_from_budget"})
 )
 
-ctd = ctd.merge(bac_total, on=["source","SUB_TEAM"], how="left")
-ctd["BAC"] = ctd["BAC"].fillna(0.0)
+ctd = ctd.merge(bac_from_budget, on=["source","SUB_TEAM"], how="left")
 
-ctd["BCWS_eff"] = np.where(ctd["BCWS"] != 0, ctd["BCWS"], ctd["BUDGET_PV"])
-ctd["ACWP_eff"] = np.where(ctd["ACWP"] != 0, ctd["ACWP"], ctd["ACWP_FALLBACK"])
+# Select BAC with provenance
+ctd["BAC_eff"] = np.where(ctd["BAC"].notna() & (ctd["BAC"] != 0), ctd["BAC"],
+                  np.where(ctd["BAC_from_budget"].notna() & (ctd["BAC_from_budget"] != 0), ctd["BAC_from_budget"], np.nan))
 
-lsd["BCWS_eff"] = np.where(lsd["BCWS"] != 0, lsd["BCWS"], lsd["BUDGET_PV"])
-lsd["ACWP_eff"] = np.where(lsd["ACWP"] != 0, lsd["ACWP"], lsd["ACWP_FALLBACK"])
+ctd["BAC_source"] = np.where(ctd["BAC"].notna() & (ctd["BAC"] != 0), "explicit_BAC",
+                      np.where(ctd["BAC_from_budget"].notna() & (ctd["BAC_from_budget"] != 0), "sum(BUDGET)", "missing"))
 
-# ============================================================
-# 6) EVMS metrics
-# ============================================================
+# -----------------------------
+# ACWP / BCWS fallbacks (still valid)
+# -----------------------------
+ctd["BCWS_eff"] = np.where(ctd["BCWS"].notna() & (ctd["BCWS"] != 0), ctd["BCWS"],
+                    np.where(ctd["BUDGET"].notna() & (ctd["BUDGET"] != 0), ctd["BUDGET"], np.nan))
+ctd["ACWP_eff"] = np.where(ctd["ACWP"].notna() & (ctd["ACWP"] != 0), ctd["ACWP"],
+                    np.where(ctd["ACWP_FALLBACK"].notna() & (ctd["ACWP_FALLBACK"] != 0), ctd["ACWP_FALLBACK"], np.nan))
+
+lsd["BCWS_eff"] = np.where(lsd["BCWS"].notna() & (lsd["BCWS"] != 0), lsd["BCWS"],
+                    np.where(lsd["BUDGET"].notna() & (lsd["BUDGET"] != 0), lsd["BUDGET"], np.nan))
+lsd["ACWP_eff"] = np.where(lsd["ACWP"].notna() & (lsd["ACWP"] != 0), lsd["ACWP"],
+                    np.where(lsd["ACWP_FALLBACK"].notna() & (lsd["ACWP_FALLBACK"] != 0), lsd["ACWP_FALLBACK"], np.nan))
+
+# -----------------------------
+# EAC logic (transparent)
+# -----------------------------
+# If EAC missing, we leave NaN by default.
+# Optional: compute a formula EAC = BAC_eff / CPI_CTD (ONLY if you want).
+ctd["EAC_eff"] = np.where(ctd["EAC"].notna() & (ctd["EAC"] != 0), ctd["EAC"], np.nan)
+ctd["EAC_source"] = np.where(ctd["EAC"].notna() & (ctd["EAC"] != 0), "explicit_EAC", "missing")
+
+# -----------------------------
+# Metrics
+# -----------------------------
 ctd["SPI_CTD"] = safe_div(ctd["BCWP"], ctd["BCWS_eff"])
 ctd["CPI_CTD"] = safe_div(ctd["BCWP"], ctd["ACWP_eff"])
-ctd["BEI_CTD"] = safe_div(ctd["BCWP"], ctd["BAC"])
-ctd["VAC_CTD"] = ctd["BAC"] - ctd.get("EAC", 0.0)
+ctd["BEI_CTD"] = safe_div(ctd["BCWP"], ctd["BAC_eff"])
+ctd["VAC_CTD"] = ctd["BAC_eff"] - ctd["EAC_eff"]
 
 lsd["SPI_LSD"] = safe_div(lsd["BCWP"], lsd["BCWS_eff"])
 lsd["CPI_LSD"] = safe_div(lsd["BCWP"], lsd["ACWP_eff"])
 
-# ============================================================
-# 7) Output tables
-# ============================================================
+# -----------------------------
+# Output tables
+# -----------------------------
 source_evms_metrics = (
     ctd.groupby("source", as_index=False)
-       .agg(BAC=("BAC","sum"),
+       .agg(BAC=("BAC_eff","sum"),
             BCWS=("BCWS_eff","sum"),
             BCWP=("BCWP","sum"),
             ACWP=("ACWP_eff","sum"),
-            EAC=("EAC","sum"))
+            EAC=("EAC_eff","sum"))
 )
 source_evms_metrics["SPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["BCWS"])
 source_evms_metrics["CPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["ACWP"])
@@ -208,15 +225,15 @@ source_lsd = (
 )
 source_lsd["SPI_LSD"] = safe_div(source_lsd["BCWP"], source_lsd["BCWS"])
 source_lsd["CPI_LSD"] = safe_div(source_lsd["BCWP"], source_lsd["ACWP"])
-
 source_evms_metrics = source_evms_metrics.merge(source_lsd[["source","SPI_LSD","CPI_LSD"]], on="source", how="left")
 
 subteam_metrics = (
-    ctd[["source","SUB_TEAM","SPI_CTD","CPI_CTD","BEI_CTD","BAC","EAC","VAC_CTD"]]
+    ctd[["source","SUB_TEAM","SPI_CTD","CPI_CTD","BEI_CTD","BAC_eff","EAC_eff","VAC_CTD","BAC_source","EAC_source"]]
+    .rename(columns={"BAC_eff":"BAC","EAC_eff":"EAC"})
     .merge(lsd[["source","SUB_TEAM","SPI_LSD","CPI_LSD"]], on=["source","SUB_TEAM"], how="left")
 )
 
-subteam_cost = subteam_metrics[["source","SUB_TEAM","BAC","EAC","VAC_CTD"]].copy()
+subteam_cost = subteam_metrics[["source","SUB_TEAM","BAC","EAC","VAC_CTD","BAC_source","EAC_source"]].copy()
 
 hours_tbl = (
     lsd[["source","SUB_TEAM","BCWS_eff","ACT_HRS","ETC"]]
@@ -225,31 +242,24 @@ hours_tbl = (
 hours_tbl["Pct_Var"] = safe_div((hours_tbl["Actual_Hours"] - hours_tbl["Demand_proxy"]), hours_tbl["Demand_proxy"])
 hours_tbl["Next_Mo_BCWS_Hours"] = np.nan
 
-# ============================================================
-# 8) Diagnostics: prove which files use which labels
-# ============================================================
-label_audit = (
-    df.groupby(["source","cost_set_norm"], as_index=False)
-      .size()
-      .pivot_table(index="source", columns="cost_set_norm", values="size", fill_value=0)
-      .reset_index()
-)
-
-diag = (
-    ctd.assign(
-        bcws_zero=lambda d: (d["BCWS_eff"] == 0).astype(float),
-        acwp_zero=lambda d: (d["ACWP_eff"] == 0).astype(float),
-        bcwp_zero=lambda d: (d["BCWP"] == 0).astype(float)
+# -----------------------------
+# Diagnostics: WHY BAC/EAC are missing
+# -----------------------------
+diag_bac_eac = (
+    subteam_cost.assign(
+        BAC_missing=lambda d: d["BAC"].isna(),
+        EAC_missing=lambda d: d["EAC"].isna()
     )
     .groupby("source", as_index=False)
-    .agg(rows=("SUB_TEAM","count"),
-         pct_BCWS_zero=("bcws_zero","mean"),
-         pct_ACWP_zero=("acwp_zero","mean"),
-         pct_BCWP_zero=("bcwp_zero","mean"))
+    .agg(
+        rows=("SUB_TEAM","count"),
+        pct_BAC_missing=("BAC_missing","mean"),
+        pct_EAC_missing=("EAC_missing","mean")
+    )
+    .sort_values(["pct_BAC_missing","pct_EAC_missing"], ascending=False)
 )
 
 print("✅ Created: source_evms_metrics, subteam_metrics, subteam_cost, hours_tbl")
-print("\n--- Coverage diagnostics (top 15) ---")
-print(diag.sort_values(["pct_BCWS_zero","pct_ACWP_zero"], ascending=False).head(15))
-print("\n--- Label audit (counts by source; check Budget/Weekly Actuals usage) ---")
-print(label_audit.head(15))
+print("\n--- BAC/EAC missing diagnostics (top 15) ---")
+print(diag_bac_eac.head(15))
+print("\nTip: filter subteam_cost where BAC_source=='missing' or EAC_source=='missing' to see which file types don't carry those metrics.")
