@@ -502,3 +502,4 @@ display(missing_summary)
 print("\n✅ Outputs in memory:",
       "cobra_fact, program_metrics, subteam_metrics, subteam_cost, hours_metrics, "
       "coverage_audit, value_from_audit, missing_summary, pipeline_issues")
+    
