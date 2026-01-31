@@ -10,20 +10,15 @@ ACCT_CLOSE_DATES = pd.to_datetime([
     "2026-07-05","2026-08-02","2026-09-06","2026-10-04","2026-11-01","2026-12-06"
 ])
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def safe_div(n, d, default=np.nan):
+def safe_div(n, d):
     n = n.astype(float)
     d = d.astype(float)
-    out = np.where(d != 0, n / d, default)
-    return out
+    return np.where(d != 0, n / d, np.nan)
 
 def norm_text(x):
     if pd.isna(x): 
         return ""
     s = str(x).strip().lower()
-    # keep letters/numbers/_ and spaces
     s = re.sub(r"[^a-z0-9_ ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
@@ -31,20 +26,19 @@ def norm_text(x):
 def norm_cost_set(raw):
     s = norm_text(raw)
 
-    # Handle common Cobra labels + drift using substring logic
-    # Order matters (more specific first)
+    # specific first
     if "acwp" in s and ("hrs" in s or "hour" in s):
         return "ACT_HRS"
     if ("acwp" in s and ("wkl" in s or "week" in s)) or ("weekly actual" in s):
         return "WEEKLY_ACTUALS"
+
+    # core EVMS
     if "acwp" in s or "actual cost" in s:
         return "ACWP"
-
     if "bcws" in s or "planned value" in s:
         return "BCWS"
     if "bcwp" in s or "earned value" in s or "progress" in s:
         return "BCWP"
-
     if "bac" in s or "budget" in s:
         return "BAC"
     if "eac" in s:
@@ -52,51 +46,35 @@ def norm_cost_set(raw):
     if "etc" in s:
         return "ETC"
 
-    return f"OTHER::{s}" if s else "OTHER::(blank)"
-
-def norm_currency(raw):
-    s = norm_text(raw).upper()
-
-    # If currency is blank, we keep "UNK" so you can inspect
-    if s in {"", "UNK", "UNKNOWN"}:
-        return "UNK"
-
-    # Hours indicators
-    if any(k in s for k in ["HRS", "HOURS", "HR"]):
-        return "HRS"
-
-    # Dollars indicators (common variants)
-    if any(k in s for k in ["USD", "DOLLAR", "$", "DOL", "COST", "AMT"]):
-        return "USD"
-
-    return s  # pass-through
+    return None  # ignore unknowns (you already confirmed there are none)
 
 # -----------------------------
-# Start from cobra_df
+# Start
 # -----------------------------
 df = cobra_df.copy()
-
-# Required columns check
-required = {"source", "SUB_TEAM", "COST-SET", "DATE", "HOURS", "Currency"}
-missing = required - set(df.columns)
-if missing:
-    raise ValueError(f"Missing required columns: {missing}")
 
 # Parse date + numeric value
 df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
 df["VALUE"] = pd.to_numeric(df["HOURS"], errors="coerce").fillna(0.0)
 
-# Normalize cost set + currency
+# Normalize cost set
 df["cost_set_norm"] = df["COST-SET"].apply(norm_cost_set)
-df["currency_norm"] = df["Currency"].apply(norm_currency)
+df = df[df["cost_set_norm"].notna()].copy()
 
-# Snapshot date per source (max DATE in the file)
+# ✅ CRITICAL FIX:
+# Force currency based on cost set (do NOT trust 'Currency' column for EVMS)
+COST_SETS_USD = {"BAC","BCWS","BCWP","ACWP","EAC","ETC"}
+COST_SETS_HRS = {"ACT_HRS","WEEKLY_ACTUALS"}
+
+df["currency_norm"] = np.where(df["cost_set_norm"].isin(COST_SETS_USD), "USD",
+                        np.where(df["cost_set_norm"].isin(COST_SETS_HRS), "HRS", "UNK"))
+
+# Snapshot date per source
 snapshot_by_source = (
     df.groupby("source", as_index=False)
       .agg(snapshot_date=("DATE", "max"))
 )
 
-# LSD close date per source = last close date <= snapshot date
 ACCT_CLOSE_DATES = pd.Series(ACCT_CLOSE_DATES).sort_values().reset_index(drop=True)
 
 def last_close(d):
@@ -121,14 +99,10 @@ snapshot_by_source["prior_close_date"] = snapshot_by_source["lsd_close_date"].ap
 df = df.merge(snapshot_by_source, on="source", how="left")
 
 # -----------------------------
-# CTD: Use all rows (cumulative snapshot extract)
+# CTD Pivot (USD + HRS separately)
 # -----------------------------
-KEEP_KEYS = {"BAC","BCWS","BCWP","ACWP","EAC","ETC","ACT_HRS","WEEKLY_ACTUALS"}
-df_ctd = df[df["cost_set_norm"].isin(KEEP_KEYS)].copy()
-
 ctd = (
-    df_ctd
-    .pivot_table(
+    df.pivot_table(
         index=["source","SUB_TEAM","currency_norm"],
         columns="cost_set_norm",
         values="VALUE",
@@ -142,19 +116,15 @@ for col in ["BAC","BCWS","BCWP","ACWP","EAC","ETC","ACT_HRS","WEEKLY_ACTUALS"]:
     if col not in ctd.columns:
         ctd[col] = 0.0
 
-# Compute metrics per currency bucket (USD vs HRS)
-ctd["SPI_CTD"] = safe_div(ctd["BCWP"], ctd["BCWS"])
-ctd["CPI_CTD"] = safe_div(ctd["BCWP"], ctd["ACWP"])
-ctd["BEI_CTD"] = safe_div(ctd["BCWP"], ctd["BAC"])
-ctd["VAC_CTD"] = ctd["BAC"] - ctd["EAC"]
-
-# Add flags so missing values are explainable instead of mysterious
-ctd["SPI_CTD_reason"] = np.where(ctd["BCWS"] == 0, "BCWS=0", "")
-ctd["CPI_CTD_reason"] = np.where(ctd["ACWP"] == 0, "ACWP=0", "")
+# CTD metrics for USD only
+ctd_usd = ctd[ctd["currency_norm"].eq("USD")].copy()
+ctd_usd["SPI_CTD"] = safe_div(ctd_usd["BCWP"], ctd_usd["BCWS"])
+ctd_usd["CPI_CTD"] = safe_div(ctd_usd["BCWP"], ctd_usd["ACWP"])
+ctd_usd["BEI_CTD"] = safe_div(ctd_usd["BCWP"], ctd_usd["BAC"])
+ctd_usd["VAC_CTD"] = ctd_usd["BAC"] - ctd_usd["EAC"]
 
 # -----------------------------
-# LSD: Filter rows by accounting window (DATE in (prior_close, lsd_close])
-# Only works if DATE is time-phased in the extract; otherwise LSD must be CTD-delta across snapshots.
+# LSD window + Pivot
 # -----------------------------
 mask_lsd = (
     df["DATE"].notna() &
@@ -163,10 +133,8 @@ mask_lsd = (
     (df["prior_close_date"].isna() | (df["DATE"] > df["prior_close_date"]))
 )
 
-df_lsd = df[mask_lsd & df["cost_set_norm"].isin(KEEP_KEYS)].copy()
-
 lsd = (
-    df_lsd
+    df[mask_lsd]
     .pivot_table(
         index=["source","SUB_TEAM","currency_norm"],
         columns="cost_set_norm",
@@ -181,19 +149,16 @@ for col in ["BAC","BCWS","BCWP","ACWP","EAC","ETC","ACT_HRS","WEEKLY_ACTUALS"]:
     if col not in lsd.columns:
         lsd[col] = 0.0
 
-lsd["SPI_LSD"] = safe_div(lsd["BCWP"], lsd["BCWS"])
-lsd["CPI_LSD"] = safe_div(lsd["BCWP"], lsd["ACWP"])
-lsd["SPI_LSD_reason"] = np.where(lsd["BCWS"] == 0, "BCWS=0", "")
-lsd["CPI_LSD_reason"] = np.where(lsd["ACWP"] == 0, "ACWP=0", "")
+lsd_usd = lsd[lsd["currency_norm"].eq("USD")].copy()
+lsd_usd["SPI_LSD"] = safe_div(lsd_usd["BCWP"], lsd_usd["BCWS"])
+lsd_usd["CPI_LSD"] = safe_div(lsd_usd["BCWP"], lsd_usd["ACWP"])
 
 # -----------------------------
-# OUTPUT TABLES (what you asked for)
+# OUTPUT TABLES
 # -----------------------------
-# 1) By source: SPI/CPI/BEI CTD + SPI/CPI LSD (USD only by default)
 source_evms_metrics = (
-    ctd[ctd["currency_norm"].isin(["USD","UNK"])]
-    .groupby("source", as_index=False)
-    .agg(BAC=("BAC","sum"), BCWS=("BCWS","sum"), BCWP=("BCWP","sum"), ACWP=("ACWP","sum"), EAC=("EAC","sum"))
+    ctd_usd.groupby("source", as_index=False)
+           .agg(BAC=("BAC","sum"), BCWS=("BCWS","sum"), BCWP=("BCWP","sum"), ACWP=("ACWP","sum"), EAC=("EAC","sum"))
 )
 source_evms_metrics["SPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["BCWS"])
 source_evms_metrics["CPI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_evms_metrics["ACWP"])
@@ -201,9 +166,8 @@ source_evms_metrics["BEI_CTD"] = safe_div(source_evms_metrics["BCWP"], source_ev
 source_evms_metrics["VAC_CTD"] = source_evms_metrics["BAC"] - source_evms_metrics["EAC"]
 
 source_lsd_metrics = (
-    lsd[lsd["currency_norm"].isin(["USD","UNK"])]
-    .groupby("source", as_index=False)
-    .agg(BCWS=("BCWS","sum"), BCWP=("BCWP","sum"), ACWP=("ACWP","sum"))
+    lsd_usd.groupby("source", as_index=False)
+           .agg(BCWS=("BCWS","sum"), BCWP=("BCWP","sum"), ACWP=("ACWP","sum"))
 )
 source_lsd_metrics["SPI_LSD"] = safe_div(source_lsd_metrics["BCWP"], source_lsd_metrics["BCWS"])
 source_lsd_metrics["CPI_LSD"] = safe_div(source_lsd_metrics["BCWP"], source_lsd_metrics["ACWP"])
@@ -214,43 +178,33 @@ source_evms_metrics = source_evms_metrics.merge(
     how="left"
 )
 
-# 2) By source + subteam: SPI/CPI CTD + LSD + BAC/EAC/VAC (USD only)
 subteam_metrics = (
-    ctd[ctd["currency_norm"].isin(["USD","UNK"])]
-    [["source","SUB_TEAM","SPI_CTD","CPI_CTD","BEI_CTD","BAC","EAC","VAC_CTD","SPI_CTD_reason","CPI_CTD_reason"]]
-    .merge(
-        lsd[lsd["currency_norm"].isin(["USD","UNK"])]
-        [["source","SUB_TEAM","SPI_LSD","CPI_LSD","SPI_LSD_reason","CPI_LSD_reason"]],
-        on=["source","SUB_TEAM"],
-        how="left"
-    )
+    ctd_usd[["source","SUB_TEAM","SPI_CTD","CPI_CTD","BEI_CTD","BAC","EAC","VAC_CTD"]]
+    .merge(lsd_usd[["source","SUB_TEAM","SPI_LSD","CPI_LSD"]], on=["source","SUB_TEAM"], how="left")
 )
 
-# 3) Cost table
 subteam_cost = subteam_metrics[["source","SUB_TEAM","BAC","EAC","VAC_CTD"]].copy()
 
-# 4) Hours table (HRS currency)
 hours_tbl = (
     lsd[lsd["currency_norm"].eq("HRS")]
     [["source","SUB_TEAM","BCWS","ACT_HRS","ETC"]]
     .rename(columns={"BCWS":"Demand_Hours","ACT_HRS":"Actual_Hours","ETC":"Next_Month_ETC_Hours"})
 )
-hours_tbl["Pct_Var"] = safe_div((hours_tbl["Actual_Hours"] - hours_tbl["Demand_Hours"]), hours_tbl["Demand_Hours"], default=np.nan)
-hours_tbl["Next_Mo_BCWS_Hours"] = np.nan  # needs explicit "next month" logic from your extract
+hours_tbl["Pct_Var"] = safe_div((hours_tbl["Actual_Hours"] - hours_tbl["Demand_Hours"]), hours_tbl["Demand_Hours"])
+hours_tbl["Next_Mo_BCWS_Hours"] = np.nan  # requires explicit next-month rule
 
 # -----------------------------
-# Diagnostics: show what didn't map + why NaNs exist
+# Quick validation: where are zeros coming from now?
 # -----------------------------
-unmapped = (
-    df[df["cost_set_norm"].str.startswith("OTHER::", na=False)]
-    ["COST-SET"]
-    .value_counts()
-    .head(25)
-)
-
 print("✅ Tables created: source_evms_metrics, subteam_metrics, subteam_cost, hours_tbl")
-print("\n--- TOP UNMAPPED COST-SET VALUES (fix mapping if needed) ---")
-print(unmapped if len(unmapped) else "None 🎉")
 
-print("\n--- Why SPI/CPI are missing (top reasons) ---")
-print(subteam_metrics[["SPI_CTD_reason","CPI_CTD_reason","SPI_LSD_reason","CPI_LSD_reason"]].replace("", np.nan).stack().value_counts().head(10))
+missing_spi = (subteam_metrics["SPI_CTD"].isna()).sum()
+missing_cpi = (subteam_metrics["CPI_CTD"].isna()).sum()
+print(f"\nMissing SPI_CTD rows: {missing_spi}")
+print(f"Missing CPI_CTD rows: {missing_cpi}")
+
+print("\nTop causes (USD):")
+tmp = ctd_usd.copy()
+tmp["SPI_missing_reason"] = np.where(tmp["BCWS"]==0, "BCWS=0", "")
+tmp["CPI_missing_reason"] = np.where(tmp["ACWP"]==0, "ACWP=0", "")
+print(tmp[["SPI_missing_reason","CPI_missing_reason"]].replace("", np.nan).stack().value_counts().head(10))
