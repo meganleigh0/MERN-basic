@@ -1,61 +1,143 @@
 import pandas as pd
-from pathlib import Path
+import numpy as np
 
-# ---- CONFIG ----
-DATA_DIR = Path("data")
-FILE_PREFIX = "cobra"          # case-insensitive
-SHEET_KEYWORDS = ["tbl", "weekly", "extract"]
+# -------------------------------
+# 1. NORMALIZE COST-SET LANGUAGE
+# -------------------------------
+COST_SET_MAP = {
+    "budget": "BAC",
+    "progress": "BCWP",
+    "bcws": "BCWS",
+    "acwp": "ACWP",
+    "acwp_wkl": "ACWP_LSD",
+    "weekly actuals": "ACWP_LSD",
+    "acwp_hrs": "ACT_HRS",
+    "etc": "ETC",
+    "eac": "EAC"
+}
 
-# ---- STORAGE ----
-frames = []
-skipped_files = []
-
-# ---- PROCESS FILES ----
-for file_path in DATA_DIR.glob("*.xlsx"):
-    if not file_path.name.lower().startswith(FILE_PREFIX.lower()):
-        continue
-
-    try:
-        xls = pd.ExcelFile(file_path)
-
-        # Find first matching sheet
-        sheet_name = next(
-            (
-                s for s in xls.sheet_names
-                if any(k in s.lower() for k in SHEET_KEYWORDS)
-            ),
-            None
-        )
-
-        if sheet_name is None:
-            skipped_files.append((file_path.name, "No matching sheet"))
-            continue
-
-        df = pd.read_excel(xls, sheet_name=sheet_name)
-
-        # ---- PROVENANCE ----
-        df["source"] = file_path.name
-        df["source_sheet"] = sheet_name
-
-        frames.append(df)
-
-        print(f"✅ Loaded {file_path.name} → {sheet_name}")
-
-    except Exception as e:
-        skipped_files.append((file_path.name, str(e)))
-
-# ---- FINAL COMBINED DATAFRAME ----
-cobra_df = (
-    pd.concat(frames, ignore_index=True)
-    if frames else pd.DataFrame()
+cobra_df["cost_set_norm"] = (
+    cobra_df["COST-SET"]
+    .str.lower()
+    .str.strip()
+    .map(COST_SET_MAP)
 )
 
-# ---- SUMMARY ----
-print("\n--- LOAD SUMMARY ---")
-print(f"Files loaded: {len(frames)}")
-print(f"Files skipped: {len(skipped_files)}")
+cobra_df = cobra_df[~cobra_df["cost_set_norm"].isna()].copy()
 
-if skipped_files:
-    print("\nSkipped files:")
-    for f, reason in skipped_files:
-        print(f" - {f}: {reason}")
+# -------------------------------
+# 2. STANDARDIZE VALUE COLUMN
+# -------------------------------
+VALUE_COL = "HOURS" if "HOURS" in cobra_df.columns else "AMOUNT"
+
+cobra_df[VALUE_COL] = pd.to_numeric(cobra_df[VALUE_COL], errors="coerce").fillna(0)
+
+# -------------------------------
+# 3. SPLIT CTD vs LSD
+# -------------------------------
+cobra_df["status_type"] = np.where(
+    cobra_df["cost_set_norm"].str.contains("LSD"),
+    "LSD",
+    "CTD"
+)
+
+# -------------------------------
+# 4. PIVOT TO EVMS SHAPE
+# -------------------------------
+evms_base = (
+    cobra_df
+    .pivot_table(
+        index=["source", "SUB_TEAM", "status_type"],
+        columns="cost_set_norm",
+        values=VALUE_COL,
+        aggfunc="sum",
+        fill_value=0
+    )
+    .reset_index()
+)
+
+# Ensure all required columns exist
+for col in ["BAC", "BCWS", "BCWP", "ACWP", "EAC", "ETC", "ACT_HRS"]:
+    if col not in evms_base:
+        evms_base[col] = 0.0
+
+# -------------------------------
+# 5. EVMS METRICS
+# -------------------------------
+evms_base = evms_base.assign(
+    SPI=lambda d: np.where(d["BCWS"] != 0, d["BCWP"] / d["BCWS"], np.nan),
+    CPI=lambda d: np.where(d["ACWP"] != 0, d["BCWP"] / d["ACWP"], np.nan),
+    BEI=lambda d: np.where(d["BAC"] != 0, d["BCWP"] / d["BAC"], np.nan),
+    VAC=lambda d: d["BAC"] - d["EAC"]
+)
+
+# -------------------------------
+# 6. TABLE 1 — SOURCE LEVEL (CTD & LSD)
+# -------------------------------
+source_evms = (
+    evms_base
+    .groupby(["source", "status_type"], as_index=False)
+    .agg(
+        BAC=("BAC", "sum"),
+        BCWS=("BCWS", "sum"),
+        BCWP=("BCWP", "sum"),
+        ACWP=("ACWP", "sum"),
+        EAC=("EAC", "sum")
+    )
+    .assign(
+        SPI=lambda d: d["BCWP"] / d["BCWS"],
+        CPI=lambda d: d["BCWP"] / d["ACWP"],
+        BEI=lambda d: d["BCWP"] / d["BAC"],
+        VAC=lambda d: d["BAC"] - d["EAC"]
+    )
+)
+
+# -------------------------------
+# 7. TABLE 2 — SOURCE + SUB TEAM (CTD & LSD)
+# -------------------------------
+subteam_evms = (
+    evms_base
+    .groupby(["source", "SUB_TEAM", "status_type"], as_index=False)
+    .agg(
+        BAC=("BAC", "sum"),
+        BCWS=("BCWS", "sum"),
+        BCWP=("BCWP", "sum"),
+        ACWP=("ACWP", "sum"),
+        EAC=("EAC", "sum"),
+        ACT_HRS=("ACT_HRS", "sum"),
+        ETC=("ETC", "sum")
+    )
+    .assign(
+        SPI=lambda d: d["BCWP"] / d["BCWS"],
+        CPI=lambda d: d["BCWP"] / d["ACWP"],
+        VAC=lambda d: d["BAC"] - d["EAC"]
+    )
+)
+
+# -------------------------------
+# 8. TABLE 3 — HOURS / FORECAST
+# -------------------------------
+hours_forecast = (
+    subteam_evms
+    .assign(
+        Demand_Hours=lambda d: d["BCWS"],
+        Actual_Hours=lambda d: d["ACT_HRS"],
+        Hours_Var_Pct=lambda d: np.where(
+            d["BCWS"] != 0,
+            (d["ACT_HRS"] - d["BCWS"]) / d["BCWS"],
+            np.nan
+        ),
+        Next_Month_ETC_Hours=lambda d: d["ETC"]
+    )
+    [["source", "SUB_TEAM", "status_type",
+      "Demand_Hours", "Actual_Hours",
+      "Hours_Var_Pct", "Next_Month_ETC_Hours"]]
+)
+
+# -------------------------------
+# DONE
+# -------------------------------
+print("✅ EVMS tables created:")
+print(" - source_evms")
+print(" - subteam_evms")
+print(" - hours_forecast")
