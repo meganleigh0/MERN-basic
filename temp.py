@@ -1,4 +1,14 @@
-# EVMS COBRA pipeline (robust, COST-SET driven, selected files only, no Excel output)
+# EVMS COBRA pipeline (COST-SET driven, selected files only, no Excel output)
+# - Only uses: DATE + COSTSET + HOURS (+ SUB_TEAM if present)
+# - Robust to different COSTSET wording (Budget/Progress/Weekly Actuals/etc.)
+# - Computes program + subteam: BCWS/BCWP/ACWP (CTD + LSD), SPI/CPI (CTD + LSD), BEI (CTD + LSD)
+# - Computes BAC/EAC/VAC (program + subteam)
+# - Computes hours metrics: Demand_Hours, Actual_Hours, %Var, Next_Mo_BCWS_Hours, Next_Mo_ETC_Hours
+#
+# Outputs (in memory):
+#   cobra_fact, program_metrics, subteam_metrics, subteam_cost, hours_metrics,
+#   coverage_audit, value_from_audit, missing_summary, pipeline_issues
+
 import pandas as pd
 import numpy as np
 import re
@@ -10,366 +20,485 @@ from datetime import datetime
 # -----------------------------
 DATA_DIR = Path("data")
 
-# Pick EXACT file names you want to test (edit as needed)
-TARGET_FILES = [
+# Pick EXACT files you want to test (edit these names to match your folder)
+SELECT_FILES = [
     "Cobra-Abrams STS 2022.xlsx",
     "Cobra-John G Weekly CAP OLY 12.07.2025.xlsx",
     "Cobra-XM30.xlsx",
     "Cobra-Stryker Bulgaria 150.xlsx",
-    # add one more Stryker if you want:
-    # "Cobra-Stryker C4ISR -F0162.xlsx",
 ]
 
-SHEET_KEYWORDS = ["tbl", "weekly", "extract", "cap_extract", "cap"]  # wide net
+# Which sheets to consider (we score & pick best per file)
+SHEET_KEYWORDS = ["tbl", "weekly", "extract", "cap", "report", "evms"]
 
-# IMPORTANT:
-# Use accounting close dates. Your screenshots show 2026-11-01 and 2026-12-06 being used.
-# Put your true close dates here (edit this list to match your calendar).
-ACCOUNTING_CLOSE_DATES = pd.to_datetime(sorted([
-    # --- 2026 close dates (PLACEHOLDER; replace with your official closes) ---
-    # Example values you already saw in output:
+# 2026 accounting period close dates (replace if you have the authoritative list)
+# IMPORTANT: this list is only used to pick CURR_CLOSE/PREV_CLOSE/NEXT_CLOSE.
+# If none match <= snapshot date, we fall back to month-end.
+ACCOUNTING_CLOSE_DATES_2026 = pd.to_datetime([
+    "2026-01-04",
+    "2026-02-01",
+    "2026-03-01",
+    "2026-03-29",
+    "2026-04-05",
+    "2026-05-03",
+    "2026-05-31",
+    "2026-06-28",
+    "2026-07-05",
+    "2026-08-02",
+    "2026-08-30",
+    "2026-09-27",
+    "2026-10-04",
     "2026-11-01",
-    "2026-12-06",
-    # add the rest...
-]))
+    "2026-11-29",
+    "2026-12-27",
+], errors="coerce").dropna().sort_values()
 
 # -----------------------------
-# HELPERS
+# HELPERS: normalize columns + costset values
 # -----------------------------
-def _clean_colname(c: str) -> str:
+def _clean_col(c: str) -> str:
     c = str(c).strip()
-    c = re.sub(r"\s+", " ", c)
-    c = c.replace("\u00A0", " ")
-    return c
+    c = re.sub(r"\s+", "_", c)
+    c = re.sub(r"[^A-Za-z0-9_]+", "", c)
+    return c.upper()
 
-def _norm_costset_value(x) -> str:
-    """Normalize COST-SET cell values so label matching works across files."""
-    s = str(x) if x is not None else ""
-    s = s.strip().upper()
-    s = s.replace("\u00A0", " ")
-    s = re.sub(r"\s+", " ", s)
-    # remove punctuation except underscores
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-
-    # normalize common variants
-    # ACWP variants
-    s = s.replace("ACWP HRS", "ACWP_HRS")
-    s = s.replace("ACWP HOURS", "ACWP_HRS")
-    s = s.replace("ACWP WKLY", "ACWP_WKL")
-    s = s.replace("WEEKLY ACTUALS", "ACWP_WKL")
-    # Budget variants
-    if s in {"BUDGET", "BUDGET PV", "BUDGET_PV", "PV"}:
-        s = "BUDGET"
-    # Progress variants often mean earned (BCWP)
-    if s in {"PROGRESS", "EARNED", "EARNED VALUE", "PERFORM", "PERFORMANCE"}:
-        s = "BCWP"
-    # ETC variants
-    if s in {"ETC", "ESTIMATE TO COMPLETE", "ESTIMATED TO COMPLETE", "TO GO", "REMAINING"}:
-        s = "ETC"
-    # EAC variants
-    if s in {"EAC", "ESTIMATE AT COMPLETION", "ESTIMATED AT COMPLETION"}:
-        s = "EAC"
-
-    return s
-
-def _pick_best_sheet(xl: pd.ExcelFile) -> str:
-    """Pick the best sheet by keywords; fallback to first sheet."""
-    scores = []
-    for sh in xl.sheet_names:
-        sh_l = sh.lower()
-        score = sum(1 for k in SHEET_KEYWORDS if k in sh_l)
-        scores.append((score, sh))
-    scores.sort(reverse=True)
-    return scores[0][1] if scores else xl.sheet_names[0]
-
-def _ensure_required_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    df.columns = [_clean_colname(c) for c in df.columns]
-
-    # Harmonize common column name differences
+def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [_clean_col(c) for c in out.columns]
+    # common aliases -> canonical
     rename_map = {}
-    for c in df.columns:
-        cl = c.lower()
-        if cl in {"cost-set", "cost set", "costset", "cost_set"}:
+    for c in out.columns:
+        if c in ["COST-SET", "COSTSET", "COST_SET"]:
             rename_map[c] = "COSTSET"
-        elif cl in {"date", "as of date", "period date", "time", "status date"}:
-            rename_map[c] = "DATE"
-        elif cl in {"hours", "hrs", "value", "amount"}:
-            # In your exports, HOURS is the numeric payload even if units are “currency” sometimes.
-            rename_map[c] = "HOURS"
-        elif cl in {"sub_team", "subteam", "sub team", "sub-team"}:
+        if c in ["SUBTEAM", "SUB_TEAM", "SUBTEAM_NAME"]:
             rename_map[c] = "SUB_TEAM"
-        elif cl in {"plug", "unit"}:
-            # keep but not required
-            rename_map[c] = "UNIT"
-
     if rename_map:
-        df = df.rename(columns=rename_map)
+        out = out.rename(columns=rename_map)
+    return out
 
-    # If SUB_TEAM missing, set to PROGRAM for rollups
+def _ensure_required_cols(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    issues = []
+    df = _normalize_columns(df)
+
+    # DATE
+    if "DATE" not in df.columns:
+        # try common date cols
+        for cand in ["PERIOD", "STATUS_DATE", "AS_OF_DATE"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "DATE"})
+                break
+    if "DATE" in df.columns:
+        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
+    else:
+        issues.append("Missing DATE column")
+
+    # COSTSET
+    if "COSTSET" not in df.columns:
+        issues.append("Missing COSTSET column")
+
+    # HOURS (the value column)
+    if "HOURS" not in df.columns:
+        # try other common numeric columns
+        for cand in ["AMOUNT", "VALUE", "HRS", "HOUR"]:
+            if cand in df.columns:
+                df = df.rename(columns={cand: "HOURS"})
+                break
+    if "HOURS" in df.columns:
+        df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce")
+    else:
+        issues.append("Missing HOURS column")
+
+    # optional: SUB_TEAM (if missing, we still compute program-level)
     if "SUB_TEAM" not in df.columns:
         df["SUB_TEAM"] = "PROGRAM"
 
-    # Parse date & numeric
-    if "DATE" in df.columns:
-        df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce")
-    if "HOURS" in df.columns:
-        df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce")
+    return df, issues
 
-    # Normalize costset values
-    if "COSTSET" in df.columns:
-        df["COSTSET_NORM"] = df["COSTSET"].map(_norm_costset_value)
-    else:
-        df["COSTSET_NORM"] = np.nan
+def _norm_costset_val(x) -> str:
+    s = "" if pd.isna(x) else str(x)
+    s = s.strip().upper()
+    s = re.sub(r"[\s\-_/]+", " ", s)
+    s = re.sub(r"[^A-Z0-9 ]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-    return df
+# Map COSTSET values -> canonical metric buckets
+# We only look at COSTSET values (NOT other columns like Currency/Plug)
+COSTSET_RULES = [
+    ("ACWP", re.compile(r"\bACWP\b|\bACTUAL\b|\bWEEKLY ACTUALS?\b|\bACWP HRS\b|\bACWP_HRS\b|\bACWP WKL\b|\bACWP_WKL\b")),
+    ("BCWS", re.compile(r"\bBCWS\b|\bBUDGET\b|\bPLANNED\b|\bPLAN\b|\bBUDGET PV\b|\bPV\b")),
+    ("BCWP", re.compile(r"\bBCWP\b|\bEARNED\b|\bPROGRESS\b|\bPERFORM\b")),
+    ("ETC",  re.compile(r"\bETC\b|\bESTIMATE TO COMPLETE\b|\bREMAINING\b|\bTO GO\b")),
+    ("EAC",  re.compile(r"\bEAC\b|\bESTIMATE AT COMPLETE\b")),
+    # optional buckets you might care about later:
+    ("OTHER", re.compile(r".*")),
+]
 
-def _close_pair_for_snapshot(snapshot_date: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp]:
+def _assign_metric_bucket(costset_series: pd.Series) -> pd.Series:
+    norm = costset_series.map(_norm_costset_val)
+    out = []
+    for v in norm:
+        b = "OTHER"
+        for name, rx in COSTSET_RULES:
+            if rx.search(v):
+                b = name
+                break
+        out.append(b)
+    return pd.Series(out, index=costset_series.index, dtype="object")
+
+# -----------------------------
+# SHEET PICKER (robust)
+# -----------------------------
+def _best_sheet(path: Path) -> tuple[str, pd.DataFrame, list[str]]:
+    issues = []
+    xl = pd.ExcelFile(path)
+    best = None
+    best_score = -1
+    best_cols = []
+
+    # score each sheet by:
+    # - keyword hits in sheet name
+    # - presence of DATE + COSTSET + HOURS
+    for sh in xl.sheet_names:
+        score = 0
+        name_l = sh.lower()
+        score += sum(1 for k in SHEET_KEYWORDS if k in name_l)
+
+        try:
+            hdr = pd.read_excel(path, sheet_name=sh, nrows=0)
+            hdr = _normalize_columns(hdr)
+            cols = set(hdr.columns)
+            needed = {"DATE", "COSTSET", "HOURS"}
+            # allow aliases: if COSTSET/HOURS not directly present, still let it compete
+            # (we will normalize later), but favor direct matches
+            score += int("DATE" in cols) + int("COSTSET" in cols) + int("HOURS" in cols)
+            # small bonus for having SUB_TEAM
+            score += 1 if "SUB_TEAM" in cols else 0
+            # small penalty for very wide or very narrow sheets
+            score -= abs(len(cols) - 15) / 50.0
+        except Exception:
+            continue
+
+        if score > best_score:
+            best = sh
+            best_score = score
+            best_cols = list(cols) if 'cols' in locals() else []
+
+    if best is None:
+        # fallback first sheet
+        best = xl.sheet_names[0]
+        issues.append("Could not score sheets; used first sheet.")
+
+    df = pd.read_excel(path, sheet_name=best)
+    df, req_issues = _ensure_required_cols(df)
+    issues.extend(req_issues)
+
+    return best, df, issues
+
+# -----------------------------
+# ACCOUNTING CLOSE UTILITIES
+# -----------------------------
+def _close_pair_for_snapshot(snapshot_date: pd.Timestamp) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
     """
-    Returns (curr_close, prev_close) based on ACCOUNTING_CLOSE_DATES.
-    If close dates list is incomplete for the snapshot year, fallback to month-ends.
+    Returns (curr_close, prev_close, next_close).
+    Uses ACCOUNTING_CLOSE_DATES_2026 if possible; else falls back to month-ends around snapshot.
     """
     if pd.isna(snapshot_date):
-        return (pd.NaT, pd.NaT)
+        return (pd.NaT, pd.NaT, pd.NaT)
 
-    closes = ACCOUNTING_CLOSE_DATES.dropna().sort_values()
-    closes = closes[closes <= snapshot_date]
+    closes = ACCOUNTING_CLOSE_DATES_2026.copy()
+    closes = closes.sort_values()
 
-    if len(closes) >= 2:
-        return closes.iloc[-1], closes.iloc[-2]
-    if len(closes) == 1:
-        return closes.iloc[-1], closes.iloc[-1]
+    le = closes[closes <= snapshot_date]
+    ge = closes[closes > snapshot_date]
 
-    # fallback: month-ends from snapshot
-    me = snapshot_date.to_period("M").to_timestamp("M")
-    prev_me = (snapshot_date.to_period("M") - 1).to_timestamp("M")
-    return me, prev_me
+    if len(le) >= 2:
+        curr_close, prev_close = le[-1], le[-2]
+    elif len(le) == 1:
+        curr_close, prev_close = le[-1], le[-1]
+    else:
+        # fallback month-ends
+        curr_close = snapshot_date.to_period("M").to_timestamp("M")
+        prev_close = (snapshot_date.to_period("M") - 1).to_timestamp("M")
 
-def _sum_by_window(df: pd.DataFrame, costset_norm: str, start_exclusive, end_inclusive) -> float:
-    d = df
-    if pd.isna(end_inclusive):
+    if len(ge) >= 1:
+        next_close = ge[0]
+    else:
+        # fallback: next month end
+        next_close = (snapshot_date.to_period("M") + 1).to_timestamp("M")
+
+    return curr_close, prev_close, next_close
+
+# -----------------------------
+# CORE AGG: sum by metric bucket over windows
+# -----------------------------
+def _sum_metric(df: pd.DataFrame, bucket: str, start_exclusive: pd.Timestamp | None, end_inclusive: pd.Timestamp | None) -> float:
+    x = df
+    x = x[x["METRIC"] == bucket]
+    if start_exclusive is not None and not pd.isna(start_exclusive):
+        x = x[x["DATE"] > start_exclusive]
+    if end_inclusive is not None and not pd.isna(end_inclusive):
+        x = x[x["DATE"] <= end_inclusive]
+    return float(x["HOURS"].sum(skipna=True))
+
+def _safe_div(num: float, den: float) -> float:
+    if den is None or den == 0 or np.isnan(den):
         return np.nan
-    m = (d["COSTSET_NORM"] == costset_norm) & (d["DATE"].notna()) & (d["HOURS"].notna())
-    m &= (d["DATE"] <= end_inclusive)
-    if pd.notna(start_exclusive):
-        m &= (d["DATE"] > start_exclusive)
-    return float(d.loc[m, "HOURS"].sum())
+    return num / den
 
-def _month_sum(df: pd.DataFrame, costset_norm: str, period: pd.Period) -> float:
-    if period is None or pd.isna(period):
-        return np.nan
-    d = df
-    m = (d["COSTSET_NORM"] == costset_norm) & d["DATE"].notna() & d["HOURS"].notna()
-    m &= (d["DATE"].dt.to_period("M") == period)
-    return float(d.loc[m, "HOURS"].sum())
-
-def _compute_one_scope(scope_df: pd.DataFrame, snapshot_date: pd.Timestamp) -> dict:
+def _compute_scope_metrics(scope_df: pd.DataFrame, snapshot_date: pd.Timestamp) -> dict:
     """
-    Compute all metrics for one (source) or (source, subteam) slice.
-    Only uses COSTSET_NORM + DATE + HOURS.
+    Compute all metrics for one scope (program or subteam).
+    Only uses DATE + METRIC (from COSTSET) + HOURS.
     """
-    curr_close, prev_close = _close_pair_for_snapshot(snapshot_date)
+    curr_close, prev_close, next_close = _close_pair_for_snapshot(snapshot_date)
 
-    # CTD cumulative to curr_close
-    bcws_ctd = _sum_by_window(scope_df, "BCWS", None, curr_close)
-    bcwp_ctd = _sum_by_window(scope_df, "BCWP", None, curr_close)
-    acwp_ctd = _sum_by_window(scope_df, "ACWP", None, curr_close)
+    # CTD (cumulative up to close)
+    bcws_ctd = _sum_metric(scope_df, "BCWS", None, curr_close)
+    bcwp_ctd = _sum_metric(scope_df, "BCWP", None, curr_close)
+    acwp_ctd = _sum_metric(scope_df, "ACWP", None, curr_close)
 
-    # LSD window (period between prev_close and curr_close)
-    bcws_lsd = _sum_by_window(scope_df, "BCWS", prev_close, curr_close)
-    bcwp_lsd = _sum_by_window(scope_df, "BCWP", prev_close, curr_close)
-    acwp_lsd = _sum_by_window(scope_df, "ACWP", prev_close, curr_close)
+    # LSD (this accounting period)
+    bcws_lsd = _sum_metric(scope_df, "BCWS", prev_close, curr_close)
+    bcwp_lsd = _sum_metric(scope_df, "BCWP", prev_close, curr_close)
+    acwp_lsd = _sum_metric(scope_df, "ACWP", prev_close, curr_close)
 
-    # SPI/CPI
-    spi_ctd = (bcwp_ctd / bcws_ctd) if bcws_ctd and bcws_ctd != 0 else np.nan
-    cpi_ctd = (bcwp_ctd / acwp_ctd) if acwp_ctd and acwp_ctd != 0 else np.nan
-    spi_lsd = (bcwp_lsd / bcws_lsd) if bcws_lsd and bcws_lsd != 0 else np.nan
-    cpi_lsd = (bcwp_lsd / acwp_lsd) if acwp_lsd and acwp_lsd != 0 else np.nan
+    # Next month planned/remaining (if present as timephased)
+    next_bcws = _sum_metric(scope_df, "BCWS", curr_close, next_close)
+    next_etc  = _sum_metric(scope_df, "ETC",  curr_close, next_close)
 
-    # BEI (treat as incremental earned-vs-planned execution index in the LSD window)
+    # BAC: interpret as total planned baseline across full file (sum of BCWS across all dates)
+    # (this avoids missing BAC for files where "Budget" is the only baseline signal)
+    bac_total = float(scope_df.loc[scope_df["METRIC"] == "BCWS", "HOURS"].sum(skipna=True))
+
+    # EAC / ETC totals: some exports provide them as a single "status" line; some as timephased.
+    # Use TOTAL across file as robust default (works for both: single line or timephased).
+    eac_total = float(scope_df.loc[scope_df["METRIC"] == "EAC", "HOURS"].sum(skipna=True))
+    etc_total = float(scope_df.loc[scope_df["METRIC"] == "ETC", "HOURS"].sum(skipna=True))
+
+    # If EAC is not present but ETC is, approximate EAC ~= ACWP_CTD + ETC_total (common EVMS relationship).
+    if (eac_total == 0 or np.isnan(eac_total)) and (etc_total and etc_total > 0):
+        eac_total = acwp_ctd + etc_total
+
+    vac = bac_total - eac_total if (bac_total and eac_total) else np.nan
+
+    spi_ctd = _safe_div(bcwp_ctd, bcws_ctd)
+    cpi_ctd = _safe_div(bcwp_ctd, acwp_ctd)
+    spi_lsd = _safe_div(bcwp_lsd, bcws_lsd)
+    cpi_lsd = _safe_div(bcwp_lsd, acwp_lsd)
+
+    # BEI: if you don’t have discrete milestones/BCWP events, a practical proxy is EV-based efficiency.
+    # Using BCWP/BCWS aligns to schedule performance; if you later add milestones, swap this.
     bei_ctd = spi_ctd
     bei_lsd = spi_lsd
 
-    # BAC/EAC/ETC/VAC:
-    # BAC from full BUDGET total (timephased) across ALL dates in extract
-    bac = float(scope_df.loc[(scope_df["COSTSET_NORM"] == "BUDGET") & scope_df["HOURS"].notna(), "HOURS"].sum())
+    # Demand/Actual hours for the current period
+    demand_hours = bcws_lsd
+    actual_hours = acwp_lsd
+    pct_var = _safe_div((actual_hours - demand_hours), demand_hours)
 
-    # EAC/ETC totals across all dates (works whether they are timephased or not)
-    eac = float(scope_df.loc[(scope_df["COSTSET_NORM"] == "EAC") & scope_df["HOURS"].notna(), "HOURS"].sum())
-    etc = float(scope_df.loc[(scope_df["COSTSET_NORM"] == "ETC") & scope_df["HOURS"].notna(), "HOURS"].sum())
+    return {
+        "SNAPSHOT_DATE": snapshot_date,
+        "CURR_CLOSE": curr_close,
+        "PREV_CLOSE": prev_close,
+        "NEXT_CLOSE": next_close,
 
-    # If EAC not present but ETC present, approximate EAC = ACWP_CTD + ETC_total (common hours forecast pattern)
-    eac_eff = eac if eac and eac != 0 else (acwp_ctd + etc if (pd.notna(acwp_ctd) and pd.notna(etc)) else np.nan)
-    vac = (bac - eac_eff) if (pd.notna(bac) and pd.notna(eac_eff)) else np.nan
+        "BCWS_CTD": bcws_ctd,
+        "BCWP_CTD": bcwp_ctd,
+        "ACWP_CTD": acwp_ctd,
 
-    # Hours metrics (status month = month of curr_close)
-    status_period = curr_close.to_period("M") if pd.notna(curr_close) else (snapshot_date.to_period("M") if pd.notna(snapshot_date) else None)
-    next_period = (status_period + 1) if status_period is not None else None
+        "BCWS_LSD": bcws_lsd,
+        "BCWP_LSD": bcwp_lsd,
+        "ACWP_LSD": acwp_lsd,
 
-    demand_hours = _month_sum(scope_df, "BCWS", status_period)
-    actual_hours = _month_sum(scope_df, "ACWP", status_period)
-    pct_var = (actual_hours / demand_hours - 1.0) if (demand_hours and demand_hours != 0) else np.nan
+        "SPI_CTD": spi_ctd,
+        "CPI_CTD": cpi_ctd,
+        "BEI_CTD": bei_ctd,
 
-    next_mo_bcws_hours = _month_sum(scope_df, "BCWS", next_period)
-    next_mo_etc_hours = _month_sum(scope_df, "ETC", next_period)
+        "SPI_LSD": spi_lsd,
+        "CPI_LSD": cpi_lsd,
+        "BEI_LSD": bei_lsd,
 
-    return dict(
-        SNAPSHOT_DATE=snapshot_date,
-        CURR_CLOSE=curr_close,
-        PREV_CLOSE=prev_close,
-        BCWS_CTD=bcws_ctd, BCWP_CTD=bcwp_ctd, ACWP_CTD=acwp_ctd,
-        BCWS_LSD=bcws_lsd, BCWP_LSD=bcwp_lsd, ACWP_LSD=acwp_lsd,
-        SPI_CTD=spi_ctd, CPI_CTD=cpi_ctd, BEI_CTD=bei_ctd,
-        SPI_LSD=spi_lsd, CPI_LSD=cpi_lsd, BEI_LSD=bei_lsd,
-        BAC=bac, EAC=eac_eff, ETC=etc, VAC=vac,
-        Demand_Hours=demand_hours, Actual_Hours=actual_hours, Pct_Var=pct_var,
-        Next_Mo_BCWS_Hours=next_mo_bcws_hours, Next_Mo_ETC_Hours=next_mo_etc_hours,
-    )
+        "BAC": bac_total,
+        "EAC": eac_total,
+        "VAC": vac,
+
+        "Demand_Hours": demand_hours,
+        "Actual_Hours": actual_hours,
+        "Pct_Var": pct_var,
+        "Next_Mo_BCWS_Hours": next_bcws,
+        "Next_Mo_ETC_Hours": next_etc,
+    }
 
 # -----------------------------
 # LOAD SELECTED FILES
 # -----------------------------
+pipeline_issues = []
 frames = []
-file_log = []
+coverage_rows = []
 
-for fn in TARGET_FILES:
+for fn in SELECT_FILES:
     p = DATA_DIR / fn
     if not p.exists():
-        file_log.append({"source": fn, "status": "missing file on disk", "sheet": None, "rows": 0})
+        pipeline_issues.append(f"Missing file: {fn}")
         continue
 
-    try:
-        xl = pd.ExcelFile(p)
-        sh = _pick_best_sheet(xl)
-        df = pd.read_excel(xl, sheet_name=sh)
-        df = _ensure_required_cols(df)
-        df["SOURCE"] = p.name
-        df["SOURCE_SHEET"] = sh
-        frames.append(df)
-        file_log.append({"source": p.name, "status": "loaded", "sheet": sh, "rows": len(df)})
-    except Exception as e:
-        file_log.append({"source": p.name, "status": f"error: {e}", "sheet": None, "rows": 0})
+    sheet_name, df, issues = _best_sheet(p)
+    if issues:
+        pipeline_issues.extend([f"{fn} | {x}" for x in issues])
+
+    # Keep only the columns we actually need + provenance
+    keep_cols = [c for c in ["DATE", "COSTSET", "HOURS", "SUB_TEAM"] if c in df.columns]
+    df = df[keep_cols].copy()
+
+    df["SOURCE"] = p.name
+    df["SOURCE_SHEET"] = sheet_name
+
+    # metric bucket from COSTSET values
+    df["COSTSET_NORM"] = df["COSTSET"].map(_norm_costset_val) if "COSTSET" in df.columns else ""
+    df["METRIC"] = _assign_metric_bucket(df["COSTSET"])
+
+    # coverage diagnostics (do NOT filter anything out here)
+    snap = df["DATE"].max() if "DATE" in df.columns else pd.NaT
+    coverage_rows.append({
+        "SOURCE": p.name,
+        "SHEET": sheet_name,
+        "rows": len(df),
+        "min_DATE": df["DATE"].min() if "DATE" in df.columns else pd.NaT,
+        "max_DATE": snap,
+        "has_DATE": "DATE" in df.columns,
+        "has_COSTSET": "COSTSET" in df.columns,
+        "has_HOURS": "HOURS" in df.columns,
+        "has_SUB_TEAM": "SUB_TEAM" in df.columns,
+        "metric_counts": df["METRIC"].value_counts(dropna=False).to_dict(),
+    })
+
+    frames.append(df)
 
 cobra_fact = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
-file_log = pd.DataFrame(file_log)
+# basic clean: drop rows missing required trio (DATE/COSTSET/HOURS)
+if not cobra_fact.empty:
+    cobra_fact = cobra_fact.dropna(subset=["DATE", "COSTSET", "HOURS"]).copy()
 
 # -----------------------------
-# COVERAGE / AUDITS (THIS IS WHERE “MISSING” USUALLY COMES FROM)
+# AUDITS (what values exist, where)
 # -----------------------------
-# Cost-set presence per source
-coverage = (
-    cobra_fact.dropna(subset=["COSTSET_NORM"])
-    .groupby(["SOURCE", "COSTSET_NORM"], as_index=False)
-    .agg(rows=("HOURS", "size"), nonnull=("HOURS", lambda s: int(s.notna().sum())), total=("HOURS", "sum"))
-)
+coverage_audit = pd.DataFrame(coverage_rows)
 
-# Quick “do we have the labels we need” audit
-NEEDED_LABELS = ["BCWS", "BCWP", "ACWP", "BUDGET", "EAC", "ETC"]
-label_audit = (
-    cobra_fact.groupby(["SOURCE", "COSTSET_NORM"], as_index=False)
-    .size()
-    .pivot_table(index="SOURCE", columns="COSTSET_NORM", values="size", fill_value=0)
-    .reset_index()
+# How much of each metric bucket is present per source?
+value_from_audit = (cobra_fact
+    .groupby(["SOURCE", "METRIC"], as_index=False)
+    .agg(rows=("HOURS", "size"),
+         nonnull_hours=("HOURS", lambda s: int(s.notna().sum())),
+         sum_hours=("HOURS", "sum"),
+         min_date=("DATE", "min"),
+         max_date=("DATE", "max"))
+    .sort_values(["SOURCE", "METRIC"])
 )
-for lab in NEEDED_LABELS:
-    if lab not in label_audit.columns:
-        label_audit[lab] = 0
-
-# A second audit: do we actually have HOURS values for those labels?
-value_from_audit = (
-    cobra_fact.groupby(["SOURCE", "COSTSET_NORM"], as_index=False)
-    .agg(hours_nonnull=("HOURS", lambda s: int(s.notna().sum())), hours_sum=("HOURS", "sum"))
-    .pivot_table(index="SOURCE", columns="COSTSET_NORM", values="hours_nonnull", fill_value=0)
-    .reset_index()
-)
-for lab in NEEDED_LABELS:
-    if lab not in value_from_audit.columns:
-        value_from_audit[lab] = 0
 
 # -----------------------------
-# PROGRAM METRICS (by SOURCE)
+# METRICS: program + subteam
 # -----------------------------
 program_rows = []
 subteam_rows = []
+subteam_cost_rows = []
+hours_rows = []
 
 if not cobra_fact.empty:
-    # snapshot date = latest DATE in each file (as-of snapshot)
-    snapshot_by_source = cobra_fact.groupby("SOURCE")["DATE"].max().reset_index().rename(columns={"DATE": "SNAPSHOT_DATE"})
-
-    for _, r in snapshot_by_source.iterrows():
-        src = r["SOURCE"]
-        snap = r["SNAPSHOT_DATE"]
-        src_df = cobra_fact[cobra_fact["SOURCE"] == src].copy()
+    for src, src_df in cobra_fact.groupby("SOURCE"):
+        snapshot = src_df["DATE"].max()
 
         # program (whole file)
-        m = _compute_one_scope(src_df, snap)
+        m = _compute_scope_metrics(src_df, snapshot)
         m["SOURCE"] = src
         program_rows.append(m)
 
-        # by subteam
+        # subteams (if any)
         for st, st_df in src_df.groupby("SUB_TEAM"):
-            mm = _compute_one_scope(st_df, snap)
+            mm = _compute_scope_metrics(st_df, snapshot)
             mm["SOURCE"] = src
             mm["SUB_TEAM"] = st
             subteam_rows.append(mm)
 
+            # cost-only table (BAC/EAC/VAC)
+            subteam_cost_rows.append({
+                "SOURCE": src,
+                "SUB_TEAM": st,
+                "SNAPSHOT_DATE": snapshot,
+                "BAC": mm["BAC"],
+                "EAC": mm["EAC"],
+                "VAC": mm["VAC"],
+            })
+
+            # hours-metrics table
+            hours_rows.append({
+                "SOURCE": src,
+                "SUB_TEAM": st,
+                "SNAPSHOT_DATE": snapshot,
+                "CURR_CLOSE": mm["CURR_CLOSE"],
+                "PREV_CLOSE": mm["PREV_CLOSE"],
+                "Demand_Hours": mm["Demand_Hours"],
+                "Actual_Hours": mm["Actual_Hours"],
+                "Pct_Var": mm["Pct_Var"],
+                "Next_Mo_BCWS_Hours": mm["Next_Mo_BCWS_Hours"],
+                "Next_Mo_ETC_Hours": mm["Next_Mo_ETC_Hours"],
+            })
+
 program_metrics = pd.DataFrame(program_rows)
 subteam_metrics = pd.DataFrame(subteam_rows)
+subteam_cost = pd.DataFrame(subteam_cost_rows)
+hours_metrics = pd.DataFrame(hours_rows)
 
 # -----------------------------
-# MISSING SUMMARY (what’s still “missing” and why)
+# MISSING SUMMARY (why things look "missing")
 # -----------------------------
-def _pct_missing(s: pd.Series) -> float:
+def _pct_nan(s: pd.Series) -> float:
     if len(s) == 0:
         return np.nan
     return float(s.isna().mean())
 
 if not subteam_metrics.empty:
-    missing_summary = (
-        subteam_metrics.groupby("SOURCE", as_index=False)
+    missing_summary = (subteam_metrics
+        .groupby("SOURCE", as_index=False)
         .agg(
             subteams=("SUB_TEAM", "nunique"),
-            pct_BCWS_CTD_missing=("BCWS_CTD", _pct_missing),
-            pct_BCWP_CTD_missing=("BCWP_CTD", _pct_missing),
-            pct_ACWP_CTD_missing=("ACWP_CTD", _pct_missing),
-            pct_BAC_missing=("BAC", _pct_missing),
-            pct_EAC_missing=("EAC", _pct_missing),
+            pct_BCWS_CTD_missing=("BCWS_CTD", _pct_nan),
+            pct_BCWP_CTD_missing=("BCWP_CTD", _pct_nan),
+            pct_ACWP_CTD_missing=("ACWP_CTD", _pct_nan),
+            pct_BAC_missing=("BAC", _pct_nan),
+            pct_EAC_missing=("EAC", _pct_nan),
+            pct_SPI_CTD_missing=("SPI_CTD", _pct_nan),
+            pct_CPI_CTD_missing=("CPI_CTD", _pct_nan),
         )
-        .sort_values(["pct_BCWS_CTD_missing","pct_ACWP_CTD_missing","pct_BAC_missing"], ascending=False)
+        .sort_values("SOURCE")
     )
 else:
     missing_summary = pd.DataFrame()
 
 # -----------------------------
-# IMPORTANT: WHY YOU WERE SEEING “MISSING” BEFORE
+# PREVIEW PRINTS
 # -----------------------------
-# If these are high, it means the file either:
-#   (a) doesn’t have that COST-SET label at all, or
-#   (b) has the label but HOURS is blank/zero, or
-#   (c) DATE parsing failed (so nothing falls into CTD/LSD windows)
-#
-# These audits show which one it is.
-#
-# Outputs kept in memory:
-#   cobra_fact, file_log, coverage, label_audit, value_from_audit,
-#   program_metrics, subteam_metrics, missing_summary
+print("✅ Loaded rows:", len(cobra_fact))
+print("✅ Sources:", cobra_fact["SOURCE"].nunique() if not cobra_fact.empty else 0)
+print("\n--- Pipeline issues (if any) ---")
+for x in pipeline_issues[:50]:
+    print(" -", x)
+if len(pipeline_issues) > 50:
+    print(f" ... ({len(pipeline_issues)-50} more)")
 
-print("Loaded files:")
-display(file_log)
+print("\n--- METRIC/UNIT COVERAGE (per source, per metric bucket) ---")
+display(value_from_audit)
 
-print("\nLabel audit (counts per SOURCE x COSTSET_NORM):")
-display(label_audit[["SOURCE"] + [c for c in NEEDED_LABELS if c in label_audit.columns]])
+print("\n--- PROGRAM METRICS (preview) ---")
+display(program_metrics)
 
-print("\nValue audit (non-null HOURS per SOURCE x COSTSET_NORM):")
-display(value_from_audit[["SOURCE"] + [c for c in NEEDED_LABELS if c in value_from_audit.columns]])
+print("\n--- SUBTEAM METRICS (preview) ---")
+display(subteam_metrics.head(50))
 
-print("\nProgram metrics (preview):")
-display(program_metrics.head(10))
-
-print("\nSubteam metrics (preview):")
-display(subteam_metrics.head(20))
-
-print("\nMissing summary (by source):")
+print("\n--- MISSING SUMMARY (by source) ---")
 display(missing_summary)
+
+print("\n✅ Outputs in memory:",
+      "cobra_fact, program_metrics, subteam_metrics, subteam_cost, hours_metrics, "
+      "coverage_audit, value_from_audit, missing_summary, pipeline_issues")
