@@ -1,9 +1,3 @@
-# ============================
-# EVMS COBRA MVP PIPELINE
-# COSTSET-DRIVEN, DELTA-BASED
-# SINGLE CELL, DEBUG-FIRST
-# ============================
-
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -19,42 +13,75 @@ FILES = {
     "XM30": "Cobra-XM30.xlsx",
 }
 
-SHEET_KEYWORDS = ["CAP", "Weekly", "Extract"]
+SHEET_HINTS = ["CAP", "Weekly", "Extract"]
 
+# acceptable aliases we will search for
+COSTSET_ALIASES = [
+    "COSTSET", "COST_SET", "COST SET",
+    "COST CATEGORY", "COST_CATEGORY",
+    "RESOURCE TYPE", "RESOURCE_TYPE"
+]
+
+HOURS_ALIASES = ["HOURS", "HRS"]
+
+# canonical mapping AFTER normalization
 COSTSET_MAP = {
-    "BCWS": ["Budget"],
-    "BCWP": ["Progress"],
-    "ACWP": ["ACWP_HRS"],
+    "BCWS": ["BUDGET"],
+    "BCWP": ["PROGRESS"],
+    "ACWP": ["ACWP", "ACWP_HRS"],
     "ETC": ["ETC"],
     "EAC": ["EAC"]
 }
 
-# ----------------------------
-# 1. Load files
-# ----------------------------
 frames = []
 
 print("\n================ LOADING FILES ================")
+
 for label, fname in FILES.items():
     path = DATA_DIR / fname
     xls = pd.ExcelFile(path)
 
-    sheet = next(s for s in xls.sheet_names if any(k in s for k in SHEET_KEYWORDS))
+    sheet = next(s for s in xls.sheet_names if any(h in s for h in SHEET_HINTS))
     df = pd.read_excel(xls, sheet)
 
     df.columns = df.columns.str.upper().str.strip()
 
-    required = {"DATE", "COSTSET", "HOURS"}
-    missing = required - set(df.columns)
+    print(f"\nFILE: {fname}")
+    print("Columns:", list(df.columns))
 
-    if missing:
-        print(f"{fname} ❌ missing {missing}")
+    # --- find DATE
+    if "DATE" not in df.columns:
+        print("❌ DATE column missing")
         continue
+
+    # --- find HOURS
+    hours_col = next((c for c in df.columns if c in HOURS_ALIASES), None)
+    if not hours_col:
+        print("❌ HOURS column missing")
+        continue
+
+    # --- find COSTSET
+    costset_col = next((c for c in df.columns if c in COSTSET_ALIASES), None)
+    if not costset_col:
+        print("❌ COSTSET column missing")
+        continue
+
+    print(f"✔ Using COSTSET column: {costset_col}")
+    print(f"✔ Using HOURS column: {hours_col}")
+
+    df = df.rename(columns={
+        costset_col: "COSTSET_RAW",
+        hours_col: "HOURS"
+    })
 
     df["DATE"] = pd.to_datetime(df["DATE"])
     df["SOURCE"] = fname
+    df["COSTSET_NORM"] = df["COSTSET_RAW"].astype(str).str.upper().str.strip()
 
-    frames.append(df[["SOURCE", "DATE", "COSTSET", "HOURS"]])
+    frames.append(df[["SOURCE", "DATE", "COSTSET_NORM", "HOURS"]])
+
+if not frames:
+    raise RuntimeError("❌ No valid files loaded")
 
 cobra = pd.concat(frames, ignore_index=True)
 
@@ -62,82 +89,66 @@ print(f"\nLoaded rows: {len(cobra):,}")
 print(cobra.groupby("SOURCE")["DATE"].agg(["min", "max"]))
 
 # ----------------------------
-# 2. Normalize COSTSET → METRIC
+# Metric normalization
 # ----------------------------
 def map_metric(costset):
-    for m, vals in COSTSET_MAP.items():
-        if costset in vals:
+    for m, keys in COSTSET_MAP.items():
+        if any(k in costset for k in keys):
             return m
     return "OTHER"
 
-cobra["METRIC"] = cobra["COSTSET"].map(map_metric)
+cobra["METRIC"] = cobra["COSTSET_NORM"].map(map_metric)
 
 print("\n================ METRIC COVERAGE ================")
-print(cobra.groupby(["SOURCE", "METRIC"]).agg(
-    rows=("HOURS", "count"),
-    sum_hours=("HOURS", "sum")
-))
+print(
+    cobra.groupby(["SOURCE", "METRIC"])
+    .agg(rows=("HOURS", "count"), sum_hours=("HOURS", "sum"))
+)
 
 # ----------------------------
-# 3. Snapshot logic
+# Snapshot logic
 # ----------------------------
-def get_closes(df):
-    closes = sorted(df["DATE"].unique())
-    curr = closes[-1]
-    prev = closes[-2] if len(closes) > 1 else closes[-1]
-    return prev, curr
+def closes(df):
+    d = sorted(df["DATE"].unique())
+    return d[-2], d[-1]
 
-# ----------------------------
-# 4. Cumulative totals
-# ----------------------------
-def cumulative_at(df, metric, date):
-    return df[
-        (df["METRIC"] == metric) &
-        (df["DATE"] <= date)
-    ]["HOURS"].sum()
+def ctd(df, metric, date):
+    return df[(df["METRIC"] == metric) & (df["DATE"] <= date)]["HOURS"].sum()
 
-# ----------------------------
-# 5. Program metrics (CORRECT)
-# ----------------------------
 rows = []
 
 print("\n================ PROGRAM METRICS ================")
 
 for src in cobra["SOURCE"].unique():
     df = cobra[cobra["SOURCE"] == src]
-    prev_close, curr_close = get_closes(df)
+    prev_close, curr_close = closes(df)
 
     print(f"\nSOURCE: {src}")
     print(f"Prev close: {prev_close}")
     print(f"Curr close: {curr_close}")
 
-    vals = {}
+    out = {"SOURCE": src, "SNAPSHOT_DATE": curr_close}
+
     for m in ["BCWS", "BCWP", "ACWP", "ETC", "EAC"]:
-        vals[f"{m}_CTD"] = cumulative_at(df, m, curr_close)
-        vals[f"{m}_PREV"] = cumulative_at(df, m, prev_close)
-        vals[f"{m}_LSD"] = vals[f"{m}_CTD"] - vals[f"{m}_PREV"]
+        out[f"{m}_CTD"] = ctd(df, m, curr_close)
+        out[f"{m}_PREV"] = ctd(df, m, prev_close)
+        out[f"{m}_LSD"] = out[f"{m}_CTD"] - out[f"{m}_PREV"]
 
-        print(f"{m}: CTD={vals[f'{m}_CTD']:.2f} | LSD={vals[f'{m}_LSD']:.2f}")
+        print(f"{m}: CTD={out[f'{m}_CTD']:.2f} | LSD={out[f'{m}_LSD']:.2f}")
 
-    # Derived metrics
-    vals["SPI_CTD"] = vals["BCWP_CTD"] / vals["BCWS_CTD"] if vals["BCWS_CTD"] else np.nan
-    vals["CPI_CTD"] = vals["BCWP_CTD"] / vals["ACWP_CTD"] if vals["ACWP_CTD"] else np.nan
-    vals["SPI_LSD"] = vals["BCWP_LSD"] / vals["BCWS_LSD"] if vals["BCWS_LSD"] else np.nan
-    vals["CPI_LSD"] = vals["BCWP_LSD"] / vals["ACWP_LSD"] if vals["ACWP_LSD"] else np.nan
+    out["SPI_CTD"] = out["BCWP_CTD"] / out["BCWS_CTD"] if out["BCWS_CTD"] else np.nan
+    out["CPI_CTD"] = out["BCWP_CTD"] / out["ACWP_CTD"] if out["ACWP_CTD"] else np.nan
+    out["SPI_LSD"] = out["BCWP_LSD"] / out["BCWS_LSD"] if out["BCWS_LSD"] else np.nan
+    out["CPI_LSD"] = out["BCWP_LSD"] / out["ACWP_LSD"] if out["ACWP_LSD"] else np.nan
 
-    # Hours & variance
-    vals["Demand_Hours"] = vals["BCWS_LSD"]
-    vals["Actual_Hours"] = vals["ACWP_LSD"]
-    vals["Pct_Var"] = (
-        (vals["Actual_Hours"] - vals["Demand_Hours"]) / vals["Demand_Hours"]
-        if vals["Demand_Hours"] else np.nan
+    out["Demand_Hours"] = out["BCWS_LSD"]
+    out["Actual_Hours"] = out["ACWP_LSD"]
+    out["Pct_Var"] = (
+        (out["Actual_Hours"] - out["Demand_Hours"]) / out["Demand_Hours"]
+        if out["Demand_Hours"] else np.nan
     )
 
-    rows.append({
-        "SOURCE": src,
-        "SNAPSHOT_DATE": curr_close,
-        **vals
-    })
+    rows.append(out)
 
 program_metrics = pd.DataFrame(rows)
 
@@ -145,9 +156,8 @@ print("\n================ FINAL PROGRAM METRICS ================")
 display(program_metrics)
 
 print("""
-NOTES:
-- All LSD values are DELTAS of cumulative totals (correct)
-- No window sums are used
-- BEI is intentionally excluded
-- Any zero here is now a REAL zero, not a bug
+✔ COSTSET auto-detected
+✔ LSD uses cumulative deltas
+✔ Zeros now indicate real absence, not bugs
+✔ BEI excluded by design
 """)
