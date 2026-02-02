@@ -4,27 +4,21 @@ import re
 from pathlib import Path
 
 # =============================================================================
-# CONFIG — EDIT ONLY THIS SECTION
+# CONFIG
 # =============================================================================
-DATA_DIR = Path("data")  # change if needed
-
+DATA_DIR = Path("data")
 SELECT_FILES = [
     "Cobra-Abrams STS 2022.xlsx",
     "Cobra-Stryker Bulgaria 150.xlsx",
     "Cobra-XM30.xlsx",
-    # "Cobra-John G Weekly CAP OLY 12.07.2025.xlsx",  # include if it has the right columns
+    # "Cobra-John G Weekly CAP OLY 12.07.2025.xlsx",
 ]
-
-# If you KNOW the sheet names, you can hardcode here. Otherwise we auto-pick.
-PREFERRED_SHEET_HINTS = [
-    "CAP", "EXTRACT", "WEEKLY", "TBL", "REPORT"
-]
+PREFERRED_SHEET_HINTS = ["CAP", "EXTRACT", "WEEKLY", "TBL", "REPORT"]
 
 # =============================================================================
 # HELPERS
 # =============================================================================
 def _norm_col(s: str) -> str:
-    """Normalize a column name: uppercase + remove all non-alphanumerics."""
     return re.sub(r"[^A-Z0-9]", "", str(s).upper().strip())
 
 def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -33,78 +27,54 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def pick_sheet(xls: pd.ExcelFile) -> str:
-    """Pick the best sheet based on hints + presence of required columns."""
-    candidates = xls.sheet_names
-
-    # Score by hint match first
     def hint_score(name: str) -> int:
         u = name.upper()
-        score = 0
-        for h in PREFERRED_SHEET_HINTS:
-            if h in u:
-                score += 1
-        return score
+        return sum(1 for h in PREFERRED_SHEET_HINTS if h in u)
 
-    # Try in descending hint score; validate required columns
-    ordered = sorted(candidates, key=lambda s: hint_score(s), reverse=True)
+    ordered = sorted(xls.sheet_names, key=lambda s: hint_score(s), reverse=True)
 
+    # Pick first sheet that has DATE + HOURS and some COSTSET-like column
     for s in ordered:
         try:
-            tmp = pd.read_excel(xls, sheet_name=s, nrows=10)
+            tmp = pd.read_excel(xls, sheet_name=s, nrows=25)
             tmp = normalize_columns(tmp)
-            req = {"DATE", "HOURS"}
-            # COSTSET can be COSTSET or COSTSET-like after normalization
-            has_costset = "COSTSET" in tmp.columns or "COSTSET" in [_norm_col(c) for c in tmp.columns]
-            if req.issubset(set(tmp.columns)) and ("COSTSET" in tmp.columns):
-                return s
-            # Some exports might call COSTSET something else; we’ll handle via scan below,
-            # but we still want a sheet that at least has DATE+HOURS and a costset-like column
-            if req.issubset(set(tmp.columns)):
-                # allow for later rename scan
+            if "DATE" in tmp.columns and "HOURS" in tmp.columns:
+                # COSTSET might be COSTSET, COSTSETX, COSTSET_ etc after normalization
+                for c in tmp.columns:
+                    if c == "COSTSET" or "COSTSET" in c:
+                        return s
+                # allow if DATE/HOURS exists; we'll fail loudly later if no COSTSET
                 return s
         except Exception:
             pass
-
-    # fallback
-    return candidates[0]
+    return xls.sheet_names[0]
 
 def find_costset_col(cols_norm):
-    """
-    After normalization, we expect COSTSET.
-    But if something weird happens, detect the closest variant.
-    """
     if "COSTSET" in cols_norm:
         return "COSTSET"
-    # Try common variants (already normalized)
+    # handle COSTSET variants
     for c in cols_norm:
-        if c.endswith("COSTSET") or c.startswith("COSTSET"):
+        if "COSTSET" in c:
             return c
     return None
 
-def coerce_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce")
+def coerce_date(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce")
 
-def coerce_num(series: pd.Series) -> pd.Series:
-    return pd.to_numeric(series, errors="coerce")
+def coerce_num(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce")
 
 def map_metric_from_costset(costset: str) -> str:
-    """
-    Map COSTSET text to a metric bucket.
-    ONLY use COSTSET (unit columns ignored).
-    """
     if costset is None or (isinstance(costset, float) and np.isnan(costset)):
         return "OTHER"
     s = str(costset).upper().strip()
-
-    # Normalize separators for matching
     s_clean = re.sub(r"[^A-Z0-9]+", " ", s).strip()
 
-    # Strong matches first
     if re.search(r"\bBCWS\b", s_clean) or "BUDGET" in s_clean:
         return "BCWS"
     if re.search(r"\bBCWP\b", s_clean) or "PROGRESS" in s_clean or "EARNED" in s_clean:
         return "BCWP"
-    if re.search(r"\bACWP\b", s_clean):
+    if re.search(r"\bACWP\b", s_clean) or "ACWPHRS" in s_clean or "ACWP HRS" in s_clean:
         return "ACWP"
     if re.search(r"\bETC\b", s_clean):
         return "ETC"
@@ -112,94 +82,91 @@ def map_metric_from_costset(costset: str) -> str:
         return "BAC"
     if re.search(r"\bEAC\b", s_clean):
         return "EAC"
-
     return "OTHER"
 
-def choose_snapshot_date(df: pd.DataFrame) -> pd.Timestamp:
-    """
-    Use max DATE as snapshot_date (export date proxy).
-    If DATE is missing, returns NaT.
-    """
-    mx = df["DATE"].max()
-    return mx
-
-def close_pair_for_snapshot(snapshot_date: pd.Timestamp, all_dates: pd.Series):
-    """
-    Choose current close = latest date <= snapshot_date
-    prev close = previous distinct date < current close
-    """
-    closes = pd.Series(pd.to_datetime(all_dates.dropna().unique()))
-    closes = closes.sort_values()
-
-    closes = closes[closes <= snapshot_date]
-    if len(closes) == 0:
-        return (pd.NaT, pd.NaT)
-
-    curr = closes.iloc[-1]
-    prev = closes.iloc[-2] if len(closes) >= 2 else closes.iloc[-1]
-    return (curr, prev)
-
-def sum_hours_up_to(df, metric, up_to_date):
-    """CTD sum: sum HOURS where METRIC == metric and DATE <= up_to_date"""
-    if pd.isna(up_to_date):
-        return np.nan
-    m = df.loc[(df["METRIC"] == metric) & (df["DATE"] <= up_to_date), "HOURS"].sum()
-    return float(m)
-
-def sum_hours_in_window(df, metric, start_date_exclusive, end_date_inclusive):
-    """Window sum for ETC next-month etc."""
-    if pd.isna(end_date_inclusive):
-        return np.nan
-    if pd.isna(start_date_exclusive):
-        start_date_exclusive = pd.Timestamp.min
-    m = df.loc[
-        (df["METRIC"] == metric) &
-        (df["DATE"] > start_date_exclusive) &
-        (df["DATE"] <= end_date_inclusive),
-        "HOURS"
-    ].sum()
-    return float(m)
-
 def safe_div(a, b):
-    if b in [0, 0.0] or pd.isna(b):
+    if b is None or pd.isna(b) or b == 0:
         return np.nan
     return a / b
 
+def ctd_sum(df, metric, up_to):
+    if pd.isna(up_to):
+        return np.nan
+    return float(df.loc[(df["METRIC"] == metric) & (df["DATE"] <= up_to), "HOURS"].sum())
+
+def window_sum(df, metric, start_excl, end_incl):
+    if pd.isna(end_incl):
+        return np.nan
+    if pd.isna(start_excl):
+        start_excl = pd.Timestamp.min
+    return float(df.loc[(df["METRIC"] == metric) & (df["DATE"] > start_excl) & (df["DATE"] <= end_incl), "HOURS"].sum())
+
+def posting_dates(df, metric):
+    """Dates where metric daily total > 0 (i.e., the metric actually changes)."""
+    d = (df.loc[df["METRIC"] == metric]
+           .groupby("DATE")["HOURS"].sum()
+           .sort_index())
+    return d[d > 0].index.to_list()
+
+def choose_closes_by_posting(df):
+    """
+    Choose close dates based on posting cadence.
+    Priority: ACWP then BCWP then BCWS.
+    If only 1 posting date exists for chosen metric, prev=curr (LSD becomes 0/NaN by design).
+    """
+    acwp_dates = posting_dates(df, "ACWP")
+    bcwp_dates = posting_dates(df, "BCWP")
+    bcws_dates = posting_dates(df, "BCWS")
+
+    # Prefer metrics that represent status posting
+    if len(acwp_dates) >= 2:
+        base = "ACWP"; dates = acwp_dates
+    elif len(bcwp_dates) >= 2:
+        base = "BCWP"; dates = bcwp_dates
+    elif len(acwp_dates) == 1:
+        base = "ACWP"; dates = acwp_dates
+    elif len(bcwp_dates) == 1:
+        base = "BCWP"; dates = bcwp_dates
+    else:
+        base = "BCWS"; dates = bcws_dates
+
+    if len(dates) == 0:
+        return (pd.NaT, pd.NaT, base)
+
+    curr = dates[-1]
+    prev = dates[-2] if len(dates) >= 2 else dates[-1]
+    return (curr, prev, base)
+
 # =============================================================================
-# 1) LOAD SELECTED FILES → LONG FACT TABLE (SOURCE, SUB_TEAM, DATE, COSTSET, HOURS, METRIC)
+# 1) LOAD FILES → cobra_fact
 # =============================================================================
-print("\n================= 1) LOADING SELECTED FILES =================")
+print("\n================= 1) LOADING FILES =================")
 frames = []
-load_log = []
+log = []
 
 for fname in SELECT_FILES:
     fpath = DATA_DIR / fname
     if not fpath.exists():
-        load_log.append({"file": fname, "status": "MISSING FILE", "sheet": None, "rows": 0, "notes": str(fpath)})
+        log.append({"file": fname, "status": "MISSING FILE", "sheet": None, "rows": 0, "notes": str(fpath)})
         continue
 
     try:
         xls = pd.ExcelFile(fpath)
         sheet = pick_sheet(xls)
-
         raw = pd.read_excel(xls, sheet_name=sheet)
         raw = normalize_columns(raw)
 
-        # Find COSTSET col
-        cost_col = find_costset_col(raw.columns.tolist())
+        cost_col = find_costset_col(list(raw.columns))
         if cost_col is None:
-            load_log.append({"file": fname, "status": "MISSING COSTSET", "sheet": sheet, "rows": len(raw), "notes": f"cols={list(raw.columns)[:15]}..."})
+            log.append({"file": fname, "status": "MISSING COSTSET", "sheet": sheet, "rows": len(raw), "notes": f"cols={list(raw.columns)[:20]}"})
             continue
-
-        # Required cols
         if "DATE" not in raw.columns or "HOURS" not in raw.columns:
-            load_log.append({"file": fname, "status": "MISSING DATE/HOURS", "sheet": sheet, "rows": len(raw), "notes": f"cols={list(raw.columns)[:15]}..."})
+            log.append({"file": fname, "status": "MISSING DATE/HOURS", "sheet": sheet, "rows": len(raw), "notes": f"cols={list(raw.columns)[:20]}"})
             continue
 
-        # SUB_TEAM optional
-        sub_col = "SUBTEAM" if "SUBTEAM" in raw.columns else ("SUB_TEAM" if "SUB_TEAM" in raw.columns else None)
-        if sub_col is None and "SUBTEAM" in raw.columns:
-            sub_col = "SUBTEAM"
+        sub_col = None
+        if "SUBTEAM" in raw.columns: sub_col = "SUBTEAM"
+        if "SUB_TEAM" in raw.columns: sub_col = "SUB_TEAM"
 
         df = pd.DataFrame({
             "SOURCE": fname,
@@ -207,127 +174,115 @@ for fname in SELECT_FILES:
             "DATE": coerce_date(raw["DATE"]),
             "COSTSET_RAW": raw[cost_col].astype(str),
             "HOURS": coerce_num(raw["HOURS"]),
-            "SUB_TEAM": raw[sub_col] if sub_col is not None else np.nan
+            "SUB_TEAM": raw[sub_col] if sub_col else np.nan
         })
 
         df["COSTSET_RAW"] = df["COSTSET_RAW"].replace({"nan": np.nan, "None": np.nan})
-        df = df.dropna(subset=["DATE"])  # must have date
-        df["HOURS"] = df["HOURS"].fillna(0.0)  # missing hours treated as 0
+        df = df.dropna(subset=["DATE"])
+        df["HOURS"] = df["HOURS"].fillna(0.0)
         df["METRIC"] = df["COSTSET_RAW"].map(map_metric_from_costset)
 
         frames.append(df)
-        load_log.append({"file": fname, "status": "OK", "sheet": sheet, "rows": len(df), "notes": f"cost_col={cost_col}, sub_col={sub_col}"})
+        log.append({"file": fname, "status": "OK", "sheet": sheet, "rows": len(df), "notes": f"cost_col={cost_col}, sub_col={sub_col}"})
 
     except Exception as e:
-        load_log.append({"file": fname, "status": "ERROR", "sheet": None, "rows": 0, "notes": repr(e)})
+        log.append({"file": fname, "status": "ERROR", "sheet": None, "rows": 0, "notes": repr(e)})
 
-load_log_df = pd.DataFrame(load_log)
+log_df = pd.DataFrame(log)
 print("\nLoad log:")
-print(load_log_df.to_string(index=False))
+print(log_df.to_string(index=False))
 
 if not frames:
-    raise RuntimeError("❌ No valid files loaded. Check load log above.")
+    raise RuntimeError("❌ No valid files loaded.")
 
 cobra_fact = pd.concat(frames, ignore_index=True)
-print(f"\nLoaded cobra_fact rows: {len(cobra_fact):,}")
-print("Sources loaded:", cobra_fact["SOURCE"].nunique())
+print(f"\nLoaded rows: {len(cobra_fact):,}")
+print("Sources:", cobra_fact["SOURCE"].unique())
 print("Date range:", cobra_fact["DATE"].min(), "→", cobra_fact["DATE"].max())
 
 # =============================================================================
-# 2) COVERAGE AUDITS (what METRICs exist? how much OTHER?)
+# 2) COVERAGE / UNMAPPED COSTSETS
 # =============================================================================
-print("\n================= 2) COVERAGE AUDITS =================")
-
-cov = (cobra_fact
-       .groupby(["SOURCE", "METRIC"])
-       .agg(rows=("HOURS", "size"),
-            sum_hours=("HOURS", "sum"),
-            min_date=("DATE", "min"),
-            max_date=("DATE", "max"))
+print("\n================= 2) COVERAGE =================")
+cov = (cobra_fact.groupby(["SOURCE","METRIC"])
+       .agg(rows=("HOURS","size"), sum_hours=("HOURS","sum"), min_date=("DATE","min"), max_date=("DATE","max"))
        .reset_index()
-       .sort_values(["SOURCE", "METRIC"]))
-
-print("\nMetric coverage by source (rows/sum/min/max):")
+       .sort_values(["SOURCE","METRIC"]))
+print("\nMetric coverage:")
 print(cov.to_string(index=False))
 
-pct_other = (cobra_fact.assign(IS_OTHER=cobra_fact["METRIC"].eq("OTHER"))
-             .groupby("SOURCE")["IS_OTHER"]
-             .mean()
+pct_other = (cobra_fact.assign(is_other=cobra_fact["METRIC"].eq("OTHER"))
+             .groupby("SOURCE")["is_other"].mean()
              .reset_index(name="pct_OTHER_rows"))
-print("\nPct OTHER rows by source (should be near 0; if high, mapping rules need update):")
+print("\nPct OTHER rows:")
 print(pct_other.to_string(index=False))
 
 top_other = (cobra_fact.loc[cobra_fact["METRIC"].eq("OTHER")]
-             .groupby(["SOURCE", "COSTSET_RAW"])
-             .size()
-             .reset_index(name="count")
-             .sort_values(["SOURCE", "count"], ascending=[True, False])
-             .groupby("SOURCE")
-             .head(10))
-print("\nTop unmapped COSTSET values (per source) — if these should be BCWS/BCWP/ACWP/ETC/BAC/EAC, tell me and we’ll add rules:")
-if len(top_other) == 0:
-    print("(none)")
-else:
-    print(top_other.to_string(index=False))
+             .groupby(["SOURCE","COSTSET_RAW"]).size().reset_index(name="count")
+             .sort_values(["SOURCE","count"], ascending=[True, False])
+             .groupby("SOURCE").head(15))
+print("\nTop OTHER costsets (if these should map, we add rules):")
+print("(none)" if len(top_other)==0 else top_other.to_string(index=False))
 
 # =============================================================================
-# 3) PROGRAM METRICS (CTD + LSD as delta-of-cumulative totals)
+# 3) PROGRAM METRICS — CLOSE DATES FROM POSTING CADENCE
 # =============================================================================
-print("\n================= 3) PROGRAM METRICS (CTD + LSD deltas) =================")
-
+print("\n================= 3) PROGRAM METRICS =================")
 program_rows = []
-snapshots = []
+snap_rows = []
 
 for src, sdf in cobra_fact.groupby("SOURCE"):
     sdf = sdf.copy()
-    snapshot_date = choose_snapshot_date(sdf)
-    curr_close, prev_close = close_pair_for_snapshot(snapshot_date, sdf["DATE"])
-    next_close = sdf["DATE"].dropna().max()
 
-    snapshots.append({
+    curr_close, prev_close, base_metric = choose_closes_by_posting(sdf)
+
+    # snapshot_date is just "what we're treating as current"
+    snapshot_date = curr_close
+
+    snap_rows.append({
         "SOURCE": src,
+        "BASE_METRIC_FOR_CLOSE": base_metric,
         "SNAPSHOT_DATE": snapshot_date,
         "CURR_CLOSE": curr_close,
         "PREV_CLOSE": prev_close,
-        "NEXT_CLOSE": next_close
+        "ACWP_posting_dates": len(posting_dates(sdf, "ACWP")),
+        "BCWP_posting_dates": len(posting_dates(sdf, "BCWP")),
+        "BCWS_posting_dates": len(posting_dates(sdf, "BCWS")),
     })
 
-    # CTD (cumulative through curr close)
-    bcws_ctd = sum_hours_up_to(sdf, "BCWS", curr_close)
-    bcwp_ctd = sum_hours_up_to(sdf, "BCWP", curr_close)
-    acwp_ctd = sum_hours_up_to(sdf, "ACWP", curr_close)
-    etc_total = sum_hours_up_to(sdf, "ETC", curr_close)
+    bcws_ctd = ctd_sum(sdf, "BCWS", curr_close)
+    bcwp_ctd = ctd_sum(sdf, "BCWP", curr_close)
+    acwp_ctd = ctd_sum(sdf, "ACWP", curr_close)
 
-    # LSD using DELTA OF CUMULATIVE (correct for weekly exports)
-    bcws_prev = sum_hours_up_to(sdf, "BCWS", prev_close)
-    bcwp_prev = sum_hours_up_to(sdf, "BCWP", prev_close)
-    acwp_prev = sum_hours_up_to(sdf, "ACWP", prev_close)
+    bcws_prev = ctd_sum(sdf, "BCWS", prev_close)
+    bcwp_prev = ctd_sum(sdf, "BCWP", prev_close)
+    acwp_prev = ctd_sum(sdf, "ACWP", prev_close)
 
     bcws_lsd = bcws_ctd - bcws_prev
     bcwp_lsd = bcwp_ctd - bcwp_prev
     acwp_lsd = acwp_ctd - acwp_prev
 
-    # BAC/EAC/VAC — if present as costsets
-    bac = sum_hours_up_to(sdf, "BAC", curr_close)
-    eac = sum_hours_up_to(sdf, "EAC", curr_close)
-    vac = bac - eac if (not pd.isna(bac) and not pd.isna(eac)) else np.nan
-
-    # SPI/CPI
     spi_ctd = safe_div(bcwp_ctd, bcws_ctd)
     cpi_ctd = safe_div(bcwp_ctd, acwp_ctd)
-
     spi_lsd = safe_div(bcwp_lsd, bcws_lsd)
     cpi_lsd = safe_div(bcwp_lsd, acwp_lsd)
 
-    # ETC next month — based on DATE window (curr_close, curr_close + 1 month]
-    next_month_end = (pd.Timestamp(curr_close) + pd.offsets.MonthEnd(1))
-    etc_next_mo = sum_hours_in_window(sdf, "ETC", curr_close, next_month_end)
+    bac = ctd_sum(sdf, "BAC", curr_close)
+    eac = ctd_sum(sdf, "EAC", curr_close)
+    vac = bac - eac if (not pd.isna(bac) and not pd.isna(eac)) else np.nan
+
+    etc_total = ctd_sum(sdf, "ETC", curr_close)
+
+    # Next month ETC = (curr_close, month-end(curr_close)+1]
+    next_month_end = pd.Timestamp(curr_close) + pd.offsets.MonthEnd(1) if not pd.isna(curr_close) else pd.NaT
+    etc_next_month = window_sum(sdf, "ETC", curr_close, next_month_end) if not pd.isna(curr_close) else np.nan
 
     program_rows.append({
         "SOURCE": src,
         "SNAPSHOT_DATE": snapshot_date,
         "CURR_CLOSE": curr_close,
         "PREV_CLOSE": prev_close,
+        "CLOSE_BASE_METRIC": base_metric,
 
         "BCWS_CTD": bcws_ctd,
         "BCWP_CTD": bcwp_ctd,
@@ -347,39 +302,38 @@ for src, sdf in cobra_fact.groupby("SOURCE"):
         "VAC": vac,
 
         "ETC_TOTAL": etc_total,
-        "ETC_NEXT_MONTH": etc_next_mo
+        "ETC_NEXT_MONTH": etc_next_month
     })
 
-snapshots_df = pd.DataFrame(snapshots)
+snapshots_df = pd.DataFrame(snap_rows)
 program_metrics = pd.DataFrame(program_rows)
 
-print("\nSnapshot/close dates per source:")
+print("\nClose-date selection diagnostics (THIS is the key):")
 print(snapshots_df.to_string(index=False))
 
-print("\nProgram metrics preview:")
+print("\nProgram metrics:")
 print(program_metrics.to_string(index=False))
 
 # =============================================================================
-# 4) SUBTEAM METRICS (same logic, but grouped by SUB_TEAM)
+# 4) SUBTEAM METRICS — USE SAME PROGRAM CLOSE DATES
 # =============================================================================
 print("\n================= 4) SUBTEAM METRICS =================")
-
 sub_rows = []
-for (src, sub), sdf in cobra_fact.groupby(["SOURCE", "SUB_TEAM"], dropna=False):
+
+for (src, sub), sdf in cobra_fact.groupby(["SOURCE","SUB_TEAM"], dropna=False):
     if pd.isna(sub):
         continue
+    meta = snapshots_df.loc[snapshots_df["SOURCE"] == src].iloc[0]
+    curr_close = meta["CURR_CLOSE"]
+    prev_close = meta["PREV_CLOSE"]
 
-    snapshot_date = snapshots_df.loc[snapshots_df["SOURCE"] == src, "SNAPSHOT_DATE"].iloc[0]
-    curr_close = snapshots_df.loc[snapshots_df["SOURCE"] == src, "CURR_CLOSE"].iloc[0]
-    prev_close = snapshots_df.loc[snapshots_df["SOURCE"] == src, "PREV_CLOSE"].iloc[0]
+    bcws_ctd = ctd_sum(sdf, "BCWS", curr_close)
+    bcwp_ctd = ctd_sum(sdf, "BCWP", curr_close)
+    acwp_ctd = ctd_sum(sdf, "ACWP", curr_close)
 
-    bcws_ctd = sum_hours_up_to(sdf, "BCWS", curr_close)
-    bcwp_ctd = sum_hours_up_to(sdf, "BCWP", curr_close)
-    acwp_ctd = sum_hours_up_to(sdf, "ACWP", curr_close)
-
-    bcws_prev = sum_hours_up_to(sdf, "BCWS", prev_close)
-    bcwp_prev = sum_hours_up_to(sdf, "BCWP", prev_close)
-    acwp_prev = sum_hours_up_to(sdf, "ACWP", prev_close)
+    bcws_prev = ctd_sum(sdf, "BCWS", prev_close)
+    bcwp_prev = ctd_sum(sdf, "BCWP", prev_close)
+    acwp_prev = ctd_sum(sdf, "ACWP", prev_close)
 
     bcws_lsd = bcws_ctd - bcws_prev
     bcwp_lsd = bcwp_ctd - bcwp_prev
@@ -387,17 +341,16 @@ for (src, sub), sdf in cobra_fact.groupby(["SOURCE", "SUB_TEAM"], dropna=False):
 
     spi_ctd = safe_div(bcwp_ctd, bcws_ctd)
     cpi_ctd = safe_div(bcwp_ctd, acwp_ctd)
-
     spi_lsd = safe_div(bcwp_lsd, bcws_lsd)
     cpi_lsd = safe_div(bcwp_lsd, acwp_lsd)
 
-    bac = sum_hours_up_to(sdf, "BAC", curr_close)
-    eac = sum_hours_up_to(sdf, "EAC", curr_close)
+    bac = ctd_sum(sdf, "BAC", curr_close)
+    eac = ctd_sum(sdf, "EAC", curr_close)
 
     sub_rows.append({
         "SOURCE": src,
         "SUB_TEAM": sub,
-        "SNAPSHOT_DATE": snapshot_date,
+        "SNAPSHOT_DATE": meta["SNAPSHOT_DATE"],
         "CURR_CLOSE": curr_close,
         "PREV_CLOSE": prev_close,
 
@@ -423,45 +376,24 @@ print("\nSubteam metrics (first 25 rows):")
 print(subteam_metrics.head(25).to_string(index=False))
 
 # =============================================================================
-# 5) ZERO/NULL DIAGNOSTICS — WHY ARE VALUES ZERO?
+# 5) WHY LSD IS ZERO? PRINT PER-SOURCE POSTING DATES + LAST CHANGE DAYS
 # =============================================================================
-print("\n================= 5) ZERO DIAGNOSTICS =================")
-
-def diag_source(src):
-    sdf = cobra_fact[cobra_fact["SOURCE"] == src].copy()
-    curr_close = snapshots_df.loc[snapshots_df["SOURCE"] == src, "CURR_CLOSE"].iloc[0]
-    prev_close = snapshots_df.loc[snapshots_df["SOURCE"] == src, "PREV_CLOSE"].iloc[0]
-
-    print("\n" + "-"*80)
+print("\n================= 5) LSD ZERO DEBUG =================")
+for src, sdf in cobra_fact.groupby("SOURCE"):
+    meta = snapshots_df.loc[snapshots_df["SOURCE"] == src].iloc[0]
+    print("\n" + "-"*90)
     print(f"SOURCE: {src}")
-    print(f"prev_close={prev_close}  curr_close={curr_close}")
-    print("Metric totals (counts/sums):")
-    tot = sdf.groupby("METRIC").agg(count=("HOURS","size"), sum=("HOURS","sum"), min_date=("DATE","min"), max_date=("DATE","max")).reset_index()
-    print(tot.to_string(index=False))
+    print(f"Close base metric: {meta['BASE_METRIC_FOR_CLOSE']}")
+    print(f"prev_close={meta['PREV_CLOSE']}  curr_close={meta['CURR_CLOSE']}")
+    for m in ["ACWP","BCWP","BCWS","ETC"]:
+        dates = posting_dates(sdf, m)
+        print(f"{m} posting dates (count={len(dates)}): last 5 -> {dates[-5:] if len(dates)>0 else dates}")
 
-    # For each metric, show if CTD changes between prev and curr
-    for metric in ["BCWS","BCWP","ACWP","ETC","BAC","EAC"]:
-        ctd_curr = sum_hours_up_to(sdf, metric, curr_close)
-        ctd_prev = sum_hours_up_to(sdf, metric, prev_close)
-        delta = ctd_curr - ctd_prev
-        print(f"\n{metric}: CTD_prev={ctd_prev:.4f}  CTD_curr={ctd_curr:.4f}  DELTA(LSD)={delta:.4f}")
-
-        # Show if any rows exist on/near the closes
-        near = sdf[(sdf["METRIC"]==metric) & (sdf["DATE"]>=prev_close - pd.Timedelta(days=45)) & (sdf["DATE"]<=curr_close + pd.Timedelta(days=5))]
-        if len(near)==0:
-            print(f"  -> No rows within ~45d of close dates for {metric}")
-        else:
-            print(f"  -> Rows near closes for {metric}: {len(near)}  (date min={near['DATE'].min()}, max={near['DATE'].max()})")
-            print(near.sort_values("DATE")[["DATE","COSTSET_RAW","HOURS"]].tail(8).to_string(index=False))
-
-# Run diag for each loaded source
-for src in cobra_fact["SOURCE"].unique():
-    diag_source(src)
+    # show whether the metric actually changes between closes
+    for m in ["BCWS","BCWP","ACWP"]:
+        c_prev = ctd_sum(sdf, m, meta["PREV_CLOSE"])
+        c_curr = ctd_sum(sdf, m, meta["CURR_CLOSE"])
+        print(f"{m} CTD_prev={c_prev:.4f}  CTD_curr={c_curr:.4f}  LSD(delta)={c_curr-c_prev:.4f}")
 
 print("\n================= DONE =================")
-print("Objects created in memory:")
-print(" - cobra_fact (long fact)")
-print(" - program_metrics (program overview)")
-print(" - subteam_metrics (subteam overview)")
-print(" - cov (coverage table)")
-print(" - snapshots_df (close dates)")
+print("Objects in memory: cobra_fact, program_metrics, subteam_metrics, snapshots_df, cov")
