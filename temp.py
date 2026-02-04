@@ -1,66 +1,45 @@
 import pandas as pd
-import re
 
-def normalize_ca_key(s: pd.Series) -> pd.Series:
-    """
-    Normalizes keys for EXACT matching only (no fuzzy logic):
-    - convert to string
-    - strip leading/trailing whitespace (incl NBSP)
-    - remove all internal whitespace
-    - normalize hyphen spacing (A - 1 -> A-1)
-    - uppercase
-    - remove trailing .0 (Excel floats)
-    """
-    s = s.astype("string")
+# ---------- HARD-CODE FILES / SHEETS ----------
+CAP_FILES = [
+    ("data/Cobra-Abrams STS 2022.xlsx", "CAP_Extract"),
+    ("data/Cobra-Abrams STS.xlsx",      "CAP_Extract"),
+]
+IPT_REF_FILE  = "data/abrams_ipt_ref.xlsx"
+IPT_CA_COL    = "Control Account No"   # in abrams_ipt_ref.xlsx
+MERGE_SUB_COL = "SUB_TEAM"             # in CAP_Extract
 
-    # Replace non-breaking spaces + trim
-    s = s.str.replace("\u00A0", " ", regex=False).str.strip()
+# ---------- NORMALIZE KEYS (EXACT MATCH ONLY) ----------
+def norm_key(x: pd.Series) -> pd.Series:
+    x = x.astype("string")
+    x = x.str.replace("\u00A0", " ", regex=False).str.strip()       # NBSP + trim
+    x = x.str.replace(r"\.0$", "", regex=True)                      # drop trailing .0
+    x = x.str.replace("–", "-", regex=False).str.replace("—", "-", regex=False)
+    x = x.str.replace(r"\s*-\s*", "-", regex=True)                  # "A - 1" -> "A-1"
+    x = x.str.replace(r"\s+", "", regex=True).str.upper()           # drop internal spaces + case
+    return x.replace("", pd.NA)
 
-    # Remove trailing .0 (common when Excel numeric becomes float)
-    s = s.str.replace(r"\.0$", "", regex=True)
+# ---------- READ + STACK CAP EXTRACTS ----------
+cap_dfs = [pd.read_excel(path, sheet_name=sheet) for path, sheet in CAP_FILES]
+merged_df = pd.concat(cap_dfs, ignore_index=True)
 
-    # Normalize hyphens/dashes to plain "-"
-    s = s.str.replace("–", "-", regex=False).str.replace("—", "-", regex=False)
+# ---------- READ IPT REFERENCE + DEDUPE ----------
+ipt_ref = pd.read_excel(IPT_REF_FILE)
+ipt_ref["CA_KEY"] = norm_key(ipt_ref[IPT_CA_COL])
+ipt_ref = ipt_ref.dropna(subset=["CA_KEY"]).drop_duplicates("CA_KEY", keep="first")[["CA_KEY", "IPT"]]
 
-    # Remove spaces around hyphens: "2096 - 4" -> "2096-4"
-    s = s.str.replace(r"\s*-\s*", "-", regex=True)
+# ---------- BUILD JOIN KEY + EXACT MERGE ----------
+merged_df["SUB_TEAM_KEY"] = norm_key(merged_df[MERGE_SUB_COL])
 
-    # Remove ALL remaining whitespace inside the string: "2096 - 4 " / "2096  -4" -> "2096-4"
-    s = s.str.replace(r"\s+", "", regex=True)
-
-    # Uppercase for consistency (in case of aa vs AA)
-    s = s.str.upper()
-
-    # Treat empty strings as missing
-    s = s.replace("", pd.NA)
-
-    return s
-
-
-# --- Build normalized join keys ---
-merged_df["SUB_TEAM_KEY"] = normalize_ca_key(merged_df["SUB_TEAM"])
-ipt_ref["CA_KEY"] = normalize_ca_key(ipt_ref["Control Account No"])
-
-# Optional: enforce uniqueness on the reference side (recommended)
-# If CA_KEY duplicates exist, this can create duplicated rows after merge.
-dupes = ipt_ref["CA_KEY"].duplicated(keep=False)
-if dupes.any():
-    print("WARNING: Duplicate Control Account No keys in reference (showing first 20):")
-    print(ipt_ref.loc[dupes, ["Control Account No", "CA_KEY", "IPT"]].head(20))
-    # choose a rule; simplest is keep first
-    ipt_ref = ipt_ref.drop_duplicates(subset=["CA_KEY"], keep="first")
-
-# --- EXACT merge (post-normalization) ---
 abrams_m_df = merged_df.merge(
-    ipt_ref[["CA_KEY", "IPT"]],
+    ipt_ref,
     left_on="SUB_TEAM_KEY",
     right_on="CA_KEY",
     how="left"
-)
+).drop(columns=["CA_KEY"])  # keep only IPT + your CAP columns
 
-# --- Diagnostics ---
+# ---------- QUICK QA ----------
 print("IPT missing:", abrams_m_df["IPT"].isna().sum(), "of", len(abrams_m_df))
-print(abrams_m_df["IPT"].value_counts(dropna=False).head(20))
-
-unmapped = abrams_m_df.loc[abrams_m_df["IPT"].isna(), "SUB_TEAM_KEY"].value_counts().head(30)
-print("Top unmapped SUB_TEAM_KEYs:\n", unmapped)
+print(abrams_m_df["IPT"].value_counts(dropna=False).head(15))
+print("\nTop unmapped SUB_TEAM_KEYs:\n",
+      abrams_m_df.loc[abrams_m_df["IPT"].isna(), "SUB_TEAM_KEY"].value_counts().head(20))
