@@ -8,45 +8,71 @@ d["HOURS"] = pd.to_numeric(d["HOURS"], errors="coerce").fillna(0)
 d["PROGRAM"]  = d["PROGRAM"].astype("string").fillna("").str.strip()
 d["COST-SET"] = d["COST-SET"].astype("string").fillna("").str.strip().str.upper()
 
-# ✅ Status close date must be driven by ACTUAL/PROGRESS (ACWP/BCWP), NOT future BCWS/ETC
-close_date = d.loc[d["COST-SET"].isin(["ACWP","BCWP"]) & d["DATE"].notna(), "DATE"].max()
+# --- per-program close date (max DATE where ACWP or BCWP exists)
+close_by_prog = (
+    d.loc[d["COST-SET"].isin(["ACWP","BCWP"]) & d["DATE"].notna()]
+    .groupby("PROGRAM")["DATE"].max()
+)
 
-# FY start (adjust if your FY doesn't start Jan 1)
-fy_start = pd.Timestamp(close_date.year, 1, 1)
+# If you truly want ONE close date for all programs, uncomment the next line:
+# close_by_prog = close_by_prog.apply(lambda _: close_by_prog.max())
 
-# Masks
-m_ctd = d["DATE"].notna() & (d["DATE"] <= close_date)
-m_ytd = d["DATE"].notna() & (d["DATE"] >= fy_start) & (d["DATE"] <= close_date)
+# --- fiscal year start per-program (calendar-year start; change if FY differs)
+fy_start_by_prog = close_by_prog.apply(lambda x: pd.Timestamp(x.year, 1, 1))
 
-# Helper: sum HOURS for a costset under a mask
-def sum_cs(mask, cs):
-    return d.loc[mask & (d["COST-SET"] == cs)].groupby("PROGRAM")["HOURS"].sum()
-
+# --- build PROGRAM index
 programs = pd.Index(sorted(d["PROGRAM"].unique()), name="PROGRAM")
+df_program_evms = pd.DataFrame({"PROGRAM": programs})
 
-df_program_evms = pd.DataFrame(index=programs).reset_index()
+# --- helper sums
+def sum_cs_upto(cs, cutoff_series, start_series=None):
+    x = d[d["COST-SET"] == cs].copy()
+    x = x.merge(cutoff_series.rename("CLOSE"), left_on="PROGRAM", right_index=True, how="left")
+    if start_series is not None:
+        x = x.merge(start_series.rename("START"), left_on="PROGRAM", right_index=True, how="left")
+        mask = x["DATE"].notna() & x["CLOSE"].notna() & (x["DATE"] <= x["CLOSE"]) & (x["DATE"] >= x["START"])
+    else:
+        mask = x["DATE"].notna() & x["CLOSE"].notna() & (x["DATE"] <= x["CLOSE"])
+    out = x.loc[mask].groupby("PROGRAM")["HOURS"].sum().reindex(programs, fill_value=0)
+    return out.to_numpy()
 
-# CTD totals (always present; missing -> 0)
-df_program_evms["BCWS_CTD"] = sum_cs(m_ctd, "BCWS").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["BCWP_CTD"] = sum_cs(m_ctd, "BCWP").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["ACWP_CTD"] = sum_cs(m_ctd, "ACWP").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["ETC_CTD"]  = sum_cs(m_ctd, "ETC").reindex(programs, fill_value=0).to_numpy()
+def point_in_time(cs, cutoff_series):
+    x = d[d["COST-SET"] == cs].copy()
+    x = x.merge(cutoff_series.rename("CLOSE"), left_on="PROGRAM", right_index=True, how="left")
+    # pull cs ONLY at the program’s close date
+    out = x.loc[x["DATE"].notna() & x["CLOSE"].notna() & (x["DATE"] == x["CLOSE"])].groupby("PROGRAM")["HOURS"].sum()
+    return out.reindex(programs, fill_value=0).to_numpy()
 
-# YTD totals (missing -> 0)
-df_program_evms["BCWS_YTD"] = sum_cs(m_ytd, "BCWS").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["BCWP_YTD"] = sum_cs(m_ytd, "BCWP").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["ACWP_YTD"] = sum_cs(m_ytd, "ACWP").reindex(programs, fill_value=0).to_numpy()
-df_program_evms["ETC_YTD"]  = sum_cs(m_ytd, "ETC").reindex(programs, fill_value=0).to_numpy()
+# --- CTD sums (through close)
+df_program_evms["BCWS_CTD"] = sum_cs_upto("BCWS", close_by_prog)
+df_program_evms["BCWP_CTD"] = sum_cs_upto("BCWP", close_by_prog)
+df_program_evms["ACWP_CTD"] = sum_cs_upto("ACWP", close_by_prog)
 
-# Ratios with NO NaNs (return 0 when denom==0)
+# --- ETC at status close date (not cumulative)
+df_program_evms["ETC_CTD"]  = point_in_time("ETC", close_by_prog)
+
+# --- YTD sums (fy start through close)
+df_program_evms["BCWS_YTD"] = sum_cs_upto("BCWS", close_by_prog, fy_start_by_prog)
+df_program_evms["BCWP_YTD"] = sum_cs_upto("BCWP", close_by_prog, fy_start_by_prog)
+df_program_evms["ACWP_YTD"] = sum_cs_upto("ACWP", close_by_prog, fy_start_by_prog)
+
+# --- ETC_YTD: keep as point-in-time too (Cobra usually treats ETC as “current forecast”)
+df_program_evms["ETC_YTD"]  = point_in_time("ETC", close_by_prog)
+
+# --- ratios (no NaNs)
 df_program_evms["SPI_CTD"] = np.where(df_program_evms["BCWS_CTD"].to_numpy() == 0, 0, df_program_evms["BCWP_CTD"] / df_program_evms["BCWS_CTD"])
 df_program_evms["CPI_CTD"] = np.where(df_program_evms["ACWP_CTD"].to_numpy() == 0, 0, df_program_evms["BCWP_CTD"] / df_program_evms["ACWP_CTD"])
 df_program_evms["SPI_YTD"] = np.where(df_program_evms["BCWS_YTD"].to_numpy() == 0, 0, df_program_evms["BCWP_YTD"] / df_program_evms["BCWS_YTD"])
 df_program_evms["CPI_YTD"] = np.where(df_program_evms["ACWP_YTD"].to_numpy() == 0, 0, df_program_evms["BCWP_YTD"] / df_program_evms["ACWP_YTD"])
 
-# Final: guarantee no missing anywhere
+# --- final cleanup
 df_program_evms = df_program_evms.fillna(0)
 
-print("Status close date used:", close_date.date())
-print("FY start used:", fy_start.date())
+# quick diagnostics: show which programs have ETC missing at close date (should now be 0, but we can detect)
+diag = (
+    pd.DataFrame({"PROGRAM": programs})
+    .assign(CLOSE=close_by_prog.reindex(programs))
+)
+print("Per-program close dates used:\n", diag)
+
 display(df_program_evms)
