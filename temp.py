@@ -19,3 +19,15 @@ SWITCH(
     x >= 0.95, "#FFFF99",
     "#C0504D"
 )
+
+Color_ST_SPI_CTD =
+VAR x = SELECTEDVALUE(SubTeam_SPI_CPI[SPI CTD])
+RETURN
+SWITCH(
+    TRUE(),
+    ISBLANK(x), BLANK(),
+    x >= 1.05, "#8EB4E3",
+    x >= 0.98, "#339966",
+    x >= 0.95, "#FFFF99",
+    "#C0504D"
+)
