@@ -127,3 +127,4 @@ print("Color columns created:",
       "\n- SubTeam_SPI_CPI: Color_SPI_LSD, Color_SPI_CTD, Color_CPI_LSD, Color_CPI_CTD",
       "\n- SubTeam_BAC_EAC_VAC: VAC_BAC, Color_VAC_BAC",
       "\n- Program_Manpower: Color_%Var")
+    
