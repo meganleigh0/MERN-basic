@@ -1,362 +1,401 @@
-# =========================
+# ============================
 # EVMS PIPELINE (ONE CELL)
-# - Uses existing dataframe: cobra_merged_df (or cobra_merged / cobra_df fallback)
-# - Computes status period end = last Thursday of PRIOR month (relative to today or AS_OF_DATE)
-# - Builds 4 PowerBI-ready tables with EXACT headers (no extras)
-# - Saves EVERYTHING to one Excel file
-# =========================
+# - Builds 4 tables with EXACT headers (no extras)
+# - Uses "last Thursday of previous month" as LAST_STATUS_DATE (relative to today)
+# - Minimizes missing values by:
+#     * normalizing column names & values
+#     * auto-resolving COST_SET / EVMS_BUCKET, SUB_TEAM, PROGRAM, HOURS, DATE
+#     * snapping the status date to the closest available DATE <= target date per Program
+#     * using safe sums + safe ratios
+# - Saves everything to ONE Excel file for Power BI (4 sheets)
+# ============================
 
 import pandas as pd
 import numpy as np
-from datetime import datetime, date
+from pathlib import Path
+from datetime import datetime, date, timedelta
 
-# -------------------------
-# 0) INPUTS YOU MAY EDIT
-# -------------------------
-AS_OF_DATE = None  # e.g. "2026-02-10" (None -> uses today's date)
-PROGRAM_FILTER = None  # e.g. ["ABRAMS_22","OLYMPUS","STRYKER_BULG","XM30"] or None
-OUTPUT_XLSX = "EVMS_PowerBI_Export.xlsx"
+# ----------------------------
+# 0) INPUT: you must already have your Cobra dataframe in memory as:
+#     cobra_merged_df
+# If yours is named differently, set it here:
+# ----------------------------
+df0 = cobra_merged_df  # <-- change if needed
 
-# -------------------------
-# 1) GET THE RAW DF
-# -------------------------
-df0 = None
-for _name in ["cobra_merged_df", "cobra_merged", "cobra_df", "df", "cobra"]:
-    if _name in globals() and isinstance(globals()[_name], pd.DataFrame):
-        df0 = globals()[_name].copy()
-        break
-if df0 is None:
-    raise ValueError("Could not find a dataframe. Expected one of: cobra_merged_df, cobra_merged, cobra_df, df, cobra")
+# ----------------------------
+# 1) CONFIG
+# ----------------------------
+PROGRAMS_KEEP = ["ABRAMS_22", "OLYMPUS", "STRYKER_BULG", "XM30"]  # adjust if needed
+OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")  # one file, 4 sheets
 
-# -------------------------
+# Metric thresholds are just for reference; this script does not color cells (Power BI handles visuals)
+# SPI/CPI/BEI: Blue >=1.05, Green 0.98-1.05, Yellow 0.95-0.98, Red <0.95
+
+# ----------------------------
 # 2) HELPERS
-# -------------------------
-def _as_dt(x):
+# ----------------------------
+def _norm_colname(c: str) -> str:
+    c = str(c).strip().upper()
+    c = c.replace(" ", "_").replace("-", "_")
+    while "__" in c:
+        c = c.replace("__", "_")
+    return c
+
+def _norm_str(s):
+    if pd.isna(s):
+        return np.nan
+    s = str(s).strip().upper()
+    s = " ".join(s.split())
+    s = s.replace("-", "_")
+    return s
+
+def _coerce_dt(x):
+    # robust datetime coercion
     return pd.to_datetime(x, errors="coerce")
 
-def safe_div(num, den):
-    num = pd.to_numeric(num, errors="coerce")
-    den = pd.to_numeric(den, errors="coerce")
-    out = np.where((den == 0) | pd.isna(den), np.nan, num / den)
-    return pd.Series(out)
+def _safe_num(x):
+    return pd.to_numeric(x, errors="coerce")
 
-def normalize_cols(d):
-    d = d.copy()
-    # Normalize column names
-    d.columns = [str(c).strip().upper().replace(" ", "_") for c in d.columns]
+def _safe_div(n, d):
+    n = pd.to_numeric(n, errors="coerce")
+    d = pd.to_numeric(d, errors="coerce")
+    out = np.where((d == 0) | pd.isna(d), np.nan, n / d)
+    return out
 
-    # Allow common variants
-    rename_map = {}
-    if "COST-SET" in d.columns and "COST_SET" not in d.columns:
-        rename_map["COST-SET"] = "COST_SET"
-    if "SUBTEAM" in d.columns and "SUB_TEAM" not in d.columns:
-        rename_map["SUBTEAM"] = "SUB_TEAM"
-    if "PROGRAMID" in d.columns and "PROGRAM" not in d.columns:
-        rename_map["PROGRAMID"] = "PROGRAM"
-    if rename_map:
-        d = d.rename(columns=rename_map)
+def last_thursday_of_month(y: int, m: int) -> pd.Timestamp:
+    # last day of month
+    if m == 12:
+        last = date(y, 12, 31)
+    else:
+        last = date(y, m + 1, 1) - timedelta(days=1)
+    # weekday: Mon=0 ... Sun=6, Thu=3
+    offset = (last.weekday() - 3) % 7
+    return pd.Timestamp(last - timedelta(days=offset))
 
-    required = ["PROGRAM", "SUB_TEAM", "COST_SET", "DATE", "HOURS"]
-    missing = [c for c in required if c not in d.columns]
-    if missing:
-        raise ValueError(f"Missing required columns: {missing}. Found: {list(d.columns)}")
+def last_thursday_previous_month(ref_dt: pd.Timestamp) -> pd.Timestamp:
+    ref_dt = pd.Timestamp(ref_dt).normalize()
+    y = ref_dt.year
+    m = ref_dt.month
+    # previous month
+    if m == 1:
+        y2, m2 = y - 1, 12
+    else:
+        y2, m2 = y, m - 1
+    return last_thursday_of_month(y2, m2)
 
-    # Normalize values
-    d["PROGRAM"] = d["PROGRAM"].astype(str).str.strip().str.upper()
-    d["SUB_TEAM"] = d["SUB_TEAM"].astype(str).str.strip().str.upper()
+def _pick_best_col(df, candidates):
+    # returns first candidate that exists
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
 
-    d["COST_SET"] = (
-        d["COST_SET"].astype(str)
-        .str.strip()
-        .str.upper()
-        .str.replace(r"\s+", "", regex=True)
-        .str.replace("-", "", regex=False)
+def _sheetname_safe(s: str) -> str:
+    # Excel sheet names max 31 chars
+    s = str(s)
+    return s[:31]
+
+# ----------------------------
+# 3) NORMALIZE INPUT DF
+# ----------------------------
+df = df0.copy()
+df.columns = [_norm_colname(c) for c in df.columns]
+
+COL_PROGRAM = _pick_best_col(df, ["PROGRAM", "PROGRAMID", "PROGRAM_ID", "PROG", "PROG_ID"])
+COL_SUBTEAM = _pick_best_col(df, ["SUB_TEAM", "SUBTEAM", "SUB_TEAM_ID", "IPT", "SUBTEAM_NAME"])
+COL_DATE = _pick_best_col(df, ["DATE", "PERIOD_END", "PERIOD_END_DATE", "STATUS_DATE", "WEEK_END", "MONTH_END"])
+COL_HOURS = _pick_best_col(df, ["HOURS", "HRS", "HOUR", "LABOR_HOURS", "TOTAL_HOURS"])
+COL_BUCKET = _pick_best_col(df, ["COST_SET", "EVMS_BUCKET", "COSTSET", "BUCKET", "COST_CATEGORY"])
+
+missing = [k for k,v in {
+    "PROGRAM": COL_PROGRAM, "SUB_TEAM": COL_SUBTEAM, "DATE": COL_DATE, "HOURS": COL_HOURS, "COST_SET/BUCKET": COL_BUCKET
+}.items() if v is None]
+if missing:
+    raise ValueError(f"Missing required columns in cobra_merged_df: {missing}\n"
+                     f"Found columns: {list(df.columns)}")
+
+df[COL_PROGRAM] = df[COL_PROGRAM].map(_norm_str)
+df[COL_SUBTEAM] = df[COL_SUBTEAM].map(_norm_str)
+df[COL_BUCKET] = df[COL_BUCKET].map(_norm_str)
+df[COL_DATE] = _coerce_dt(df[COL_DATE])
+df[COL_HOURS] = _safe_num(df[COL_HOURS])
+
+# filter programs
+df = df[df[COL_PROGRAM].isin([_norm_str(p) for p in PROGRAMS_KEEP])].copy()
+
+# keep only relevant buckets (normalize to the 4 we use)
+# We'll accept anything that CONTAINS these tokens, then map to canonical bucket names
+def _map_bucket(b):
+    if pd.isna(b):
+        return np.nan
+    b = str(b).upper()
+    b = b.replace("-", "_").replace(" ", "_")
+    if "BCWS" in b: return "BCWS"
+    if "BCWP" in b: return "BCWP"
+    if "ACWP" in b: return "ACWP"
+    if "ETC"  in b: return "ETC"
+    return np.nan
+
+df["BUCKET_STD"] = df[COL_BUCKET].map(_map_bucket)
+df = df[~df["BUCKET_STD"].isna()].copy()
+
+# ----------------------------
+# 4) STATUS DATES (LAST STATUS + NEXT PERIOD)
+# - Last status date = last Thursday of previous month (relative to today)
+# - But your data DATE may not land exactly on that Thursday,
+#   so we SNAP per-program to the closest available DATE <= target.
+# ----------------------------
+today = pd.Timestamp.today().normalize()
+target_last_status = last_thursday_previous_month(today)
+
+# per-program snap to available date <= target
+def _snap_asof_by_program(dfp, target_dt):
+    # returns dict program -> snapped_date (max date <= target, else max date overall)
+    out = {}
+    for prog, g in dfp.groupby(COL_PROGRAM, dropna=False):
+        dates = g[COL_DATE].dropna().sort_values().unique()
+        if len(dates) == 0:
+            out[prog] = pd.NaT
+            continue
+        # all dates <= target
+        le = dates[dates <= np.datetime64(target_dt)]
+        if len(le) > 0:
+            out[prog] = pd.Timestamp(le.max()).normalize()
+        else:
+            # if nothing before target, fall back to max available
+            out[prog] = pd.Timestamp(dates.max()).normalize()
+    return out
+
+asof_by_prog = _snap_asof_by_program(df, target_last_status)
+
+# next period end (last Thursday of the month AFTER the snapped last status month)
+def _next_period_target(d):
+    if pd.isna(d):
+        return pd.NaT
+    d = pd.Timestamp(d)
+    y, m = d.year, d.month
+    if m == 12:
+        return last_thursday_of_month(y + 1, 1)
+    return last_thursday_of_month(y, m + 1)
+
+next_target_by_prog = {p: _next_period_target(d) for p, d in asof_by_prog.items()}
+
+# per-program snap next period to the closest available DATE <= next_target AND > last_status
+def _snap_next_by_program(dfp):
+    out = {}
+    for prog, g in dfp.groupby(COL_PROGRAM, dropna=False):
+        last_dt = asof_by_prog.get(prog, pd.NaT)
+        nxt_tgt = next_target_by_prog.get(prog, pd.NaT)
+        dates = g[COL_DATE].dropna().sort_values().unique()
+        if pd.isna(last_dt) or pd.isna(nxt_tgt) or len(dates) == 0:
+            out[prog] = pd.NaT
+            continue
+        cand = dates[(dates > np.datetime64(last_dt)) & (dates <= np.datetime64(nxt_tgt))]
+        if len(cand) > 0:
+            out[prog] = pd.Timestamp(cand.max()).normalize()
+        else:
+            out[prog] = pd.NaT
+    return out
+
+next_asof_by_prog = _snap_next_by_program(df)
+
+# add these to df as row-level columns
+df["ASOF_DATE"] = df[COL_PROGRAM].map(asof_by_prog)
+df["NEXT_ASOF_DATE"] = df[COL_PROGRAM].map(next_asof_by_prog)
+
+# ----------------------------
+# 5) CORE AGGS
+# ----------------------------
+# CTD window: all rows with DATE <= ASOF_DATE
+ctd = df[df[COL_DATE] <= df["ASOF_DATE"]].copy()
+
+# LSD window: rows at the snapped as-of date (exact match)
+lsd = df[df[COL_DATE] == df["ASOF_DATE"]].copy()
+
+# Next-month window: rows at snapped NEXT_ASOF_DATE
+nxt = df[df[COL_DATE] == df["NEXT_ASOF_DATE"]].copy()
+
+def _sum_hours(dfx, group_cols):
+    # returns wide df with BCWS/BCWP/ACWP/ETC sums
+    g = (
+        dfx.groupby(group_cols + ["BUCKET_STD"], dropna=False)[COL_HOURS]
+        .sum(min_count=1)
+        .reset_index()
     )
+    wide = g.pivot_table(
+        index=group_cols,
+        columns="BUCKET_STD",
+        values=COL_HOURS,
+        aggfunc="sum"
+    ).reset_index()
+    # ensure all expected bucket cols exist
+    for b in ["BCWS", "BCWP", "ACWP", "ETC"]:
+        if b not in wide.columns:
+            wide[b] = np.nan
+    # flatten pivot columns
+    wide.columns = [c if isinstance(c, str) else str(c) for c in wide.columns]
+    return wide
 
-    # Canonical EVMS buckets (exactly what we use)
-    cost_map = {
-        "BCWS": "BCWS",
-        "BCWP": "BCWP",
-        "ACWP": "ACWP",
-        "ETC":  "ETC",
-    }
-    d["EVMS_BUCKET"] = d["COST_SET"].map(cost_map)
-    d["DATE"] = _as_dt(d["DATE"])
-    d["HOURS"] = pd.to_numeric(d["HOURS"], errors="coerce")
+# Program totals (CTD/LSD)
+prog_ctd = _sum_hours(ctd, [COL_PROGRAM])
+prog_lsd = _sum_hours(lsd, [COL_PROGRAM])
 
-    # Keep only usable rows for this pipeline
-    d = d.dropna(subset=["PROGRAM", "SUB_TEAM", "DATE", "HOURS", "EVMS_BUCKET"]).copy()
-    return d
+# Subteam totals (CTD/LSD)
+sub_ctd = _sum_hours(ctd, [COL_PROGRAM, COL_SUBTEAM])
+sub_lsd = _sum_hours(lsd, [COL_PROGRAM, COL_SUBTEAM])
 
-def last_thursday_of_month(any_day):
-    """Return last Thursday (weekday=3) for the month containing any_day."""
-    any_day = pd.Timestamp(any_day).normalize()
-    last_day = (any_day + pd.offsets.MonthEnd(0)).normalize()
-    # Thursday=3
-    offset = (last_day.weekday() - 3) % 7
-    return (last_day - pd.Timedelta(days=offset)).normalize()
+# Next-period program totals (for manpower)
+prog_nxt = _sum_hours(nxt, [COL_PROGRAM])
 
-def status_period_end(as_of):
-    """
-    LAST STATUS DATE rule:
-    - last Thursday of the PRIOR month relative to as_of
-    Examples:
-      as_of=Feb 10 -> last Thu of Jan
-      as_of=Jan 28 -> last Thu of Dec
-    """
-    as_of = pd.Timestamp(as_of).normalize()
-    prior_month_day = (as_of - pd.offsets.MonthBegin(1))  # any day in prior month
-    return last_thursday_of_month(prior_month_day)
+# ----------------------------
+# 6) BUILD TABLES (EXACT HEADERS)
+# ----------------------------
 
-def build_period_calendar(min_date, max_date):
-    """
-    Build monthly period_end calendar = last Thursday of each month, spanning min_date..max_date.
-    """
-    min_date = pd.Timestamp(min_date).normalize()
-    max_date = pd.Timestamp(max_date).normalize()
-    start = (min_date - pd.offsets.MonthBegin(1)).normalize()
-    end = (max_date + pd.offsets.MonthEnd(2)).normalize()
+# ---- 6A) Program_Overview: ProgramID, Metric, CTD, LSD, Comments / Root Cause & Corrective Actions
+# SPI = BCWP/BCWS, CPI = BCWP/ACWP, BEI (approx) = BCWP/ETC (your earlier deck used BEI alongside CPI/SPI)
+po = prog_ctd.merge(prog_lsd, on=[COL_PROGRAM], how="outer", suffixes=("_CTD", "_LSD"))
 
-    months = pd.date_range(start=start, end=end, freq="MS")
-    ends = pd.Series([last_thursday_of_month(m) for m in months], dtype="datetime64[ns]").drop_duplicates().sort_values()
-    return ends.reset_index(drop=True)
+po["SPI_CTD"] = _safe_div(po["BCWP_CTD"] if "BCWP_CTD" in po.columns else po["BCWP"], po["BCWS_CTD"] if "BCWS_CTD" in po.columns else po["BCWS"])
+po["CPI_CTD"] = _safe_div(po["BCWP_CTD"] if "BCWP_CTD" in po.columns else po["BCWP"], po["ACWP_CTD"] if "ACWP_CTD" in po.columns else po["ACWP"])
+po["BEI_CTD"] = _safe_div(po["BCWP_CTD"] if "BCWP_CTD" in po.columns else po["BCWP"], po["ETC_CTD"]  if "ETC_CTD"  in po.columns else po["ETC"])
 
-def assign_period_end(dates, period_ends):
-    """
-    For each DATE, assign the first period_end >= DATE (like "belongs to that status month").
-    Uses searchsorted safely.
-    """
-    pe = pd.to_datetime(period_ends).values.astype("datetime64[ns]")
-    dt = pd.to_datetime(dates).values.astype("datetime64[ns]")
-    idx = np.searchsorted(pe, dt, side="left")
-    out = np.where(idx < len(pe), pe[idx], np.datetime64("NaT"))
-    return pd.to_datetime(out)
+po["SPI_LSD"] = _safe_div(po["BCWP_LSD"] if "BCWP_LSD" in po.columns else po["BCWP"], po["BCWS_LSD"] if "BCWS_LSD" in po.columns else po["BCWS"])
+po["CPI_LSD"] = _safe_div(po["BCWP_LSD"] if "BCWP_LSD" in po.columns else po["BCWP"], po["ACWP_LSD"] if "ACWP_LSD" in po.columns else po["ACWP"])
+po["BEI_LSD"] = _safe_div(po["BCWP_LSD"] if "BCWP_LSD" in po.columns else po["BCWP"], po["ETC_LSD"]  if "ETC_LSD"  in po.columns else po["ETC"])
 
-# -------------------------
-# 3) NORMALIZE + FILTER
-# -------------------------
-df = normalize_cols(df0)
+program_overview = pd.concat([
+    pd.DataFrame({
+        "ProgramID": po[COL_PROGRAM],
+        "Metric": "SPI",
+        "CTD": po["SPI_CTD"],
+        "LSD": po["SPI_LSD"],
+        "Comments / Root Cause & Corrective Actions": ""
+    }),
+    pd.DataFrame({
+        "ProgramID": po[COL_PROGRAM],
+        "Metric": "CPI",
+        "CTD": po["CPI_CTD"],
+        "LSD": po["CPI_LSD"],
+        "Comments / Root Cause & Corrective Actions": ""
+    }),
+    pd.DataFrame({
+        "ProgramID": po[COL_PROGRAM],
+        "Metric": "BEI",
+        "CTD": po["BEI_CTD"],
+        "LSD": po["BEI_LSD"],
+        "Comments / Root Cause & Corrective Actions": ""
+    })
+], ignore_index=True)
 
-if PROGRAM_FILTER is not None:
-    wanted = [str(x).strip().upper() for x in PROGRAM_FILTER]
-    df = df[df["PROGRAM"].isin(wanted)].copy()
+# ---- 6B) SubTeam_SPI_CPI: SubTeam, SPI LSD, SPI CTD, CPI LSD, CPI CTD, Comments / Root Cause & Corrective Actions, ProgramID
+st = sub_ctd.merge(sub_lsd, on=[COL_PROGRAM, COL_SUBTEAM], how="outer", suffixes=("_CTD", "_LSD"))
 
-as_of = pd.Timestamp(AS_OF_DATE).normalize() if AS_OF_DATE else pd.Timestamp.today().normalize()
-status_end = status_period_end(as_of)  # last Thu of PRIOR month (always in the past)
-next_end = last_thursday_of_month(as_of)  # last Thu of CURRENT month (may be future)
+st["SPI_CTD"] = _safe_div(st["BCWP_CTD"] if "BCWP_CTD" in st.columns else st["BCWP"], st["BCWS_CTD"] if "BCWS_CTD" in st.columns else st["BCWS"])
+st["CPI_CTD"] = _safe_div(st["BCWP_CTD"] if "BCWP_CTD" in st.columns else st["BCWP"], st["ACWP_CTD"] if "ACWP_CTD" in st.columns else st["ACWP"])
+st["SPI_LSD"] = _safe_div(st["BCWP_LSD"] if "BCWP_LSD" in st.columns else st["BCWP"], st["BCWS_LSD"] if "BCWS_LSD" in st.columns else st["BCWS"])
+st["CPI_LSD"] = _safe_div(st["BCWP_LSD"] if "BCWP_LSD" in st.columns else st["BCWP"], st["ACWP_LSD"] if "ACWP_LSD" in st.columns else st["ACWP"])
 
-# Build period calendar from data range (but ensure it covers status_end/next_end too)
-min_dt = min(df["DATE"].min(), status_end, next_end)
-max_dt = max(df["DATE"].max(), status_end, next_end)
-period_ends = build_period_calendar(min_dt, max_dt)
-
-df["PERIOD_END"] = assign_period_end(df["DATE"], period_ends)
-
-# Keep only rows up through the status period for CTD/LSD computations
-df_hist = df[df["PERIOD_END"].notna() & (df["PERIOD_END"] <= status_end)].copy()
-
-# -------------------------
-# 4) PERIOD PIVOT (PROGRAM+SUBTEAM+PERIOD_END) -> BCWS/BCWP/ACWP/ETC columns
-# -------------------------
-g = (
-    df_hist
-    .groupby(["PROGRAM", "SUB_TEAM", "PERIOD_END", "EVMS_BUCKET"], dropna=False)["HOURS"]
-    .sum()
-    .reset_index()
-)
-
-pivot = (
-    g.pivot_table(index=["PROGRAM", "SUB_TEAM", "PERIOD_END"], columns="EVMS_BUCKET", values="HOURS", aggfunc="sum", fill_value=0.0)
-    .reset_index()
-)
-
-for c in ["BCWS", "BCWP", "ACWP", "ETC"]:
-    if c not in pivot.columns:
-        pivot[c] = 0.0
-
-pivot = pivot.sort_values(["PROGRAM", "SUB_TEAM", "PERIOD_END"]).reset_index(drop=True)
-
-# Cumulative-to-date for BCWS/BCWP/ACWP (ETC is treated as "current period" value)
-for c in ["BCWS", "BCWP", "ACWP"]:
-    pivot[f"{c}_CTD"] = pivot.groupby(["PROGRAM", "SUB_TEAM"], dropna=False)[c].cumsum()
-
-pivot["ETC_CUR"] = pivot["ETC"]  # current period ETC (not cumulative)
-
-# Extract LSD = status period values; CTD = cumulative at status
-status_rows = pivot[pivot["PERIOD_END"] == status_end].copy()
-
-# If a subteam has no row exactly at status_end, create a 0 row so PowerBI has stable schema
-all_keys = pivot[["PROGRAM","SUB_TEAM"]].drop_duplicates()
-status_rows = all_keys.merge(status_rows, on=["PROGRAM","SUB_TEAM"], how="left")
-for c in ["BCWS","BCWP","ACWP","ETC","BCWS_CTD","BCWP_CTD","ACWP_CTD","ETC_CUR"]:
-    if c in status_rows.columns:
-        status_rows[c] = pd.to_numeric(status_rows[c], errors="coerce").fillna(0.0)
-status_rows["PERIOD_END"] = status_end
-
-# Previous period CTD (for BEI_LSD denominator)
-prev_end = period_ends[period_ends < status_end].max() if (period_ends < status_end).any() else pd.NaT
-prev_rows = pivot[pivot["PERIOD_END"] == prev_end][["PROGRAM","SUB_TEAM","BCWS_CTD","BCWP_CTD"]].copy() if pd.notna(prev_end) else pd.DataFrame(columns=["PROGRAM","SUB_TEAM","BCWS_CTD","BCWP_CTD"])
-prev_rows = all_keys.merge(prev_rows, on=["PROGRAM","SUB_TEAM"], how="left").fillna(0.0)
-
-# -------------------------
-# 5) SUBTEAM SPI/CPI (LSD + CTD)
-# -------------------------
-sub = status_rows.merge(prev_rows, on=["PROGRAM","SUB_TEAM"], suffixes=("","_PREV"))
-
-sub["SPI_LSD"] = safe_div(sub["BCWP"], sub["BCWS"])
-sub["SPI_CTD"] = safe_div(sub["BCWP_CTD"], sub["BCWS_CTD"])
-sub["CPI_LSD"] = safe_div(sub["BCWP"], sub["ACWP"])
-sub["CPI_CTD"] = safe_div(sub["BCWP_CTD"], sub["ACWP_CTD"])
-
-# -------------------------
-# 6) PROGRAM-LEVEL METRICS (SPI/CPI/BEI) for overview table
-#    - Program BAC = BCWS_CTD at the LATEST period available in df_hist (per program)
-# -------------------------
-# Build program-period totals
-prog_period = (
-    pivot.groupby(["PROGRAM","PERIOD_END"], dropna=False)[["BCWS","BCWP","ACWP","BCWS_CTD","BCWP_CTD","ACWP_CTD","ETC_CUR"]]
-    .sum()
-    .reset_index()
-    .sort_values(["PROGRAM","PERIOD_END"])
-)
-
-# Program BAC = latest BCWS_CTD available in history for that program
-prog_bac = (
-    prog_period.sort_values(["PROGRAM","PERIOD_END"])
-    .groupby("PROGRAM", dropna=False)["BCWS_CTD"]
-    .last()
-    .rename("BAC_TOTAL")
-    .reset_index()
-)
-
-prog_status = prog_period[prog_period["PERIOD_END"] == status_end].copy()
-prog_status = prog_bac.merge(prog_status, on="PROGRAM", how="left").fillna(0.0)
-
-# Previous program BCWS_CTD (for BEI_LSD denom)
-if pd.notna(prev_end):
-    prog_prev = prog_period[prog_period["PERIOD_END"] == prev_end][["PROGRAM","BCWS_CTD","BCWP_CTD"]].copy()
-else:
-    prog_prev = pd.DataFrame({"PROGRAM": prog_status["PROGRAM"], "BCWS_CTD": 0.0, "BCWP_CTD": 0.0})
-prog_prev = prog_status[["PROGRAM"]].merge(prog_prev, on="PROGRAM", how="left").fillna(0.0).rename(columns={"BCWS_CTD":"BCWS_CTD_PREV","BCWP_CTD":"BCWP_CTD_PREV"})
-prog_status = prog_status.merge(prog_prev, on="PROGRAM", how="left")
-
-# Compute SPI/CPI and BEI
-prog_status["SPI_LSD"] = safe_div(prog_status["BCWP"], prog_status["BCWS"])
-prog_status["SPI_CTD"] = safe_div(prog_status["BCWP_CTD"], prog_status["BCWS_CTD"])
-prog_status["CPI_LSD"] = safe_div(prog_status["BCWP"], prog_status["ACWP"])
-prog_status["CPI_CTD"] = safe_div(prog_status["BCWP_CTD"], prog_status["ACWP_CTD"])
-
-# BEI definition used here:
-# - BEI_CTD = BCWP_CTD / BAC_TOTAL
-# - BEI_LSD = BCWP_LSD / (BAC_TOTAL - BCWS_CTD_PREV)  (progress this period vs remaining baseline)
-prog_status["BEI_CTD"] = safe_div(prog_status["BCWP_CTD"], prog_status["BAC_TOTAL"])
-prog_status["BEI_LSD"] = safe_div(prog_status["BCWP"], (prog_status["BAC_TOTAL"] - prog_status["BCWS_CTD_PREV"]).clip(lower=0))
-
-# -------------------------
-# 7) SUBTEAM BAC/EAC/VAC (hours)
-#    - BAC_HRS = BCWS_CTD (through status)
-#    - EAC_HRS = ACWP_CTD + ETC_CUR (current ETC at status)
-#    - VAC_HRS = BAC_HRS - EAC_HRS
-# -------------------------
-sub_bac = sub.copy()
-sub_bac["BAC_HRS"] = sub_bac["BCWS_CTD"]
-sub_bac["EAC_HRS"] = sub_bac["ACWP_CTD"] + sub_bac["ETC_CUR"]
-sub_bac["VAC_HRS"] = sub_bac["BAC_HRS"] - sub_bac["EAC_HRS"]
-
-# -------------------------
-# 8) PROGRAM MANPOWER (hours) + NEXT MONTH (period_end == next_end)
-#    - Demand Hours = BCWS_CTD
-#    - Actual Hours = ACWP_CTD
-#    - % Var = Actual / Demand
-#    - Next Mo BCWS/ETC = totals in period_end == next_end (may be missing if future)
-# -------------------------
-prog_man = prog_status[["PROGRAM","BCWS_CTD","ACWP_CTD"]].copy()
-prog_man = prog_man.rename(columns={"BCWS_CTD":"DEMAND_HRS_CTD","ACWP_CTD":"ACTUAL_HRS_CTD"})
-prog_man["PCT_VAR"] = safe_div(prog_man["ACTUAL_HRS_CTD"], prog_man["DEMAND_HRS_CTD"])
-
-# Next period totals (if available in data)
-next_period = (
-    df[df["PERIOD_END"] == next_end]
-    .groupby(["PROGRAM","EVMS_BUCKET"], dropna=False)["HOURS"]
-    .sum()
-    .unstack("EVMS_BUCKET")
-)
-for c in ["BCWS","ETC"]:
-    if c not in next_period.columns:
-        next_period[c] = np.nan
-next_period = next_period.reset_index().rename(columns={"BCWS":"NEXT_PERIOD_BCWS_HRS","ETC":"NEXT_PERIOD_ETC_HRS"})
-
-prog_man = prog_man.merge(next_period[["PROGRAM","NEXT_PERIOD_BCWS_HRS","NEXT_PERIOD_ETC_HRS"]], on="PROGRAM", how="left")
-
-# -------------------------
-# 9) BUILD EXACT OUTPUT TABLES (EXACT HEADERS ONLY)
-# -------------------------
-
-# (A) Program overview table
-# EXACT HEADERS: ProgramID | Metric | CTD | LSD | Comments / Root Cause & Corrective Actions
-program_overview_rows = []
-for _, r in prog_status.sort_values("PROGRAM").iterrows():
-    program_overview_rows += [
-        {"ProgramID": r["PROGRAM"], "Metric": "SPI", "CTD": r["SPI_CTD"], "LSD": r["SPI_LSD"], "Comments / Root Cause & Corrective Actions": ""},
-        {"ProgramID": r["PROGRAM"], "Metric": "CPI", "CTD": r["CPI_CTD"], "LSD": r["CPI_LSD"], "Comments / Root Cause & Corrective Actions": ""},
-        {"ProgramID": r["PROGRAM"], "Metric": "BEI", "CTD": r["BEI_CTD"], "LSD": r["BEI_LSD"], "Comments / Root Cause & Corrective Actions": ""},
-    ]
-program_overview = pd.DataFrame(program_overview_rows, columns=[
-    "ProgramID","Metric","CTD","LSD","Comments / Root Cause & Corrective Actions"
-])
-
-# (B) Subteam SPI/CPI table
-# EXACT HEADERS: SubTeam | SPI LSD | SPI CTD | CPI LSD | CPI CTD | Comments / Root Cause & Corrective Actions | ProgramID
 subteam_spi_cpi = pd.DataFrame({
-    "SubTeam": sub["SUB_TEAM"],
-    "SPI LSD": sub["SPI_LSD"],
-    "SPI CTD": sub["SPI_CTD"],
-    "CPI LSD": sub["CPI_LSD"],
-    "CPI CTD": sub["CPI_CTD"],
+    "SubTeam": st[COL_SUBTEAM],
+    "SPI LSD": st["SPI_LSD"],
+    "SPI CTD": st["SPI_CTD"],
+    "CPI LSD": st["CPI_LSD"],
+    "CPI CTD": st["CPI_CTD"],
     "Comments / Root Cause & Corrective Actions": "",
-    "ProgramID": sub["PROGRAM"],
-})[[
-    "SubTeam","SPI LSD","SPI CTD","CPI LSD","CPI CTD","Comments / Root Cause & Corrective Actions","ProgramID"
-]].sort_values(["ProgramID","SubTeam"])
+    "ProgramID": st[COL_PROGRAM]
+})
 
-# (C) Subteam BAC/EAC/VAC table
-# EXACT HEADERS: SubTeam | BAC | EAC | VAC | Comments / Root Cause & Corrective Actions | ProgramID
+# ---- 6C) SubTeam_BAC_EAC_VAC: SubTeam, BAC, EAC, VAC, Comments / Root Cause & Corrective Actions, ProgramID
+# If your Cobra dataset truly has BAC/EAC/VAC in HOURS by bucket or separate fields, plug them here.
+# For now (based on your current data snapshots), we derive:
+#   BAC ~ BCWS_CTD (planned budgeted hours-to-date proxy)
+#   EAC ~ ACWP_CTD + ETC_CTD (estimate at completion proxy)
+#   VAC ~ BAC - EAC
+# This eliminates "Missing value" rows as long as buckets exist.
+bac_eac = sub_ctd.copy()
+# ensure columns exist
+for b in ["BCWS", "ACWP", "ETC"]:
+    if b not in bac_eac.columns:
+        bac_eac[b] = np.nan
+
+bac_eac["BAC"] = bac_eac["BCWS"]
+bac_eac["EAC"] = (bac_eac["ACWP"].fillna(0) + bac_eac["ETC"].fillna(0)).replace({0: np.nan}).where(
+    ~(bac_eac["ACWP"].isna() & bac_eac["ETC"].isna()), np.nan
+)
+bac_eac["VAC"] = bac_eac["BAC"] - bac_eac["EAC"]
+
 subteam_bac_eac_vac = pd.DataFrame({
-    "SubTeam": sub_bac["SUB_TEAM"],
-    "BAC": sub_bac["BAC_HRS"],
-    "EAC": sub_bac["EAC_HRS"],
-    "VAC": sub_bac["VAC_HRS"],
+    "SubTeam": bac_eac[COL_SUBTEAM],
+    "BAC": bac_eac["BAC"],
+    "EAC": bac_eac["EAC"],
+    "VAC": bac_eac["VAC"],
     "Comments / Root Cause & Corrective Actions": "",
-    "ProgramID": sub_bac["PROGRAM"],
-})[[
-    "SubTeam","BAC","EAC","VAC","Comments / Root Cause & Corrective Actions","ProgramID"
-]].sort_values(["ProgramID","SubTeam"])
+    "ProgramID": bac_eac[COL_PROGRAM]
+})
 
-# (D) Program manpower table
-# EXACT HEADERS: ProgramID | Demand Hours | Actual Hours | % Var | Next Mo BCWS Hours | Next Mo ETC Hours | Comments / Root Cause & Corrective Actions
+# ---- 6D) Program_Manpower: ProgramID, Demand Hours, Actual Hours, % Var, Next Mo BCWS Hours, Next Mo ETC Hours, Comments / Root Cause & Corrective Actions
+pm = prog_ctd.merge(prog_nxt, on=[COL_PROGRAM], how="left", suffixes=("_CTD", "_NEXT"))
+# demand=BCWS, actual=ACWP
+pm["Demand Hours"] = pm["BCWS"] if "BCWS" in pm.columns else np.nan
+pm["Actual Hours"] = pm["ACWP"] if "ACWP" in pm.columns else np.nan
+pm["% Var"] = _safe_div(pm["Actual Hours"], pm["Demand Hours"]) * 100.0
+
+pm["Next Mo BCWS Hours"] = pm["BCWS_NEXT"] if "BCWS_NEXT" in pm.columns else np.nan
+pm["Next Mo ETC Hours"] = pm["ETC_NEXT"] if "ETC_NEXT" in pm.columns else np.nan
+
 program_manpower = pd.DataFrame({
-    "ProgramID": prog_man["PROGRAM"],
-    "Demand Hours": prog_man["DEMAND_HRS_CTD"],
-    "Actual Hours": prog_man["ACTUAL_HRS_CTD"],
-    "% Var": prog_man["PCT_VAR"] * 100.0,
-    "Next Mo BCWS Hours": prog_man["NEXT_PERIOD_BCWS_HRS"],
-    "Next Mo ETC Hours": prog_man["NEXT_PERIOD_ETC_HRS"],
-    "Comments / Root Cause & Corrective Actions": "",
-})[[
-    "ProgramID","Demand Hours","Actual Hours","% Var","Next Mo BCWS Hours","Next Mo ETC Hours","Comments / Root Cause & Corrective Actions"
-]].sort_values("ProgramID")
+    "ProgramID": pm[COL_PROGRAM],
+    "Demand Hours": pm["Demand Hours"],
+    "Actual Hours": pm["Actual Hours"],
+    "% Var": pm["% Var"],
+    "Next Mo BCWS Hours": pm["Next Mo BCWS Hours"],
+    "Next Mo ETC Hours": pm["Next Mo ETC Hours"],
+    "Comments / Root Cause & Corrective Actions": ""
+})
 
-# -------------------------
-# 10) SAVE ONE EXCEL FILE (PowerBI friendly)
-# -------------------------
+# ----------------------------
+# 7) CLEAN UP (reduce missing values further)
+# - Drop blank/NaN subteams
+# - Replace inf with NaN
+# - Sort for readability
+# ----------------------------
+def _clean(df_):
+    out = df_.replace([np.inf, -np.inf], np.nan).copy()
+    return out
+
+program_overview = _clean(program_overview)
+subteam_spi_cpi = _clean(subteam_spi_cpi)
+subteam_bac_eac_vac = _clean(subteam_bac_eac_vac)
+program_manpower = _clean(program_manpower)
+
+subteam_spi_cpi = subteam_spi_cpi[~subteam_spi_cpi["SubTeam"].isna() & (subteam_spi_cpi["SubTeam"] != "")]
+subteam_bac_eac_vac = subteam_bac_eac_vac[~subteam_bac_eac_vac["SubTeam"].isna() & (subteam_bac_eac_vac["SubTeam"] != "")]
+
+program_overview = program_overview.sort_values(["ProgramID", "Metric"], kind="stable")
+subteam_spi_cpi = subteam_spi_cpi.sort_values(["ProgramID", "SubTeam"], kind="stable")
+subteam_bac_eac_vac = subteam_bac_eac_vac.sort_values(["ProgramID", "SubTeam"], kind="stable")
+program_manpower = program_manpower.sort_values(["ProgramID"], kind="stable")
+
+# ----------------------------
+# 8) SAVE ONE EXCEL FILE (Power BI input)
+# - Sheet names match what you showed in Excel tabs
+# ----------------------------
 with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
-    program_overview.to_excel(writer, sheet_name="Program_Overview", index=False)
-    subteam_spi_cpi.to_excel(writer, sheet_name="SubTeam_SPI_CPI", index=False)
-    subteam_bac_eac_vac.to_excel(writer, sheet_name="SubTeam_BAC_EAC_VAC", index=False)
-    program_manpower.to_excel(writer, sheet_name="Program_Manpower", index=False)
+    program_overview.to_excel(writer, sheet_name=_sheetname_safe("Program_Overview"), index=False)
+    subteam_spi_cpi.to_excel(writer, sheet_name=_sheetname_safe("SubTeam_SPI_CPI"), index=False)
+    subteam_bac_eac_vac.to_excel(writer, sheet_name=_sheetname_safe("SubTeam_BAC_EAC_VAC"), index=False)
+    program_manpower.to_excel(writer, sheet_name=_sheetname_safe("Program_Manpower"), index=False)
 
-print("✅ Export complete:", OUTPUT_XLSX)
-print("As-of date:", as_of.date())
-print("Last status period end (last Thu of prior month):", status_end.date())
-print("Next period end (last Thu of current month):", next_end.date())
-print("Programs exported:", sorted(program_overview["ProgramID"].unique().tolist()))
+print("✅ Saved:", str(OUTPUT_XLSX.resolve()))
+print("Status-date logic:")
+print("  Today:", today.date())
+print("  Target last-status (last Thu of prev month):", target_last_status.date())
+print("  Snapped ASOF per program:", {k: (v.date() if not pd.isna(v) else None) for k,v in asof_by_prog.items()})
+print("  Snapped NEXT per program:", {k: (v.date() if not pd.isna(v) else None) for k,v in next_asof_by_prog.items()})
+
+# Optional quick checks:
+display(program_overview.head(50))
+display(subteam_spi_cpi.head(50))
+display(subteam_bac_eac_vac.head(50))
+display(program_manpower.head(50))
