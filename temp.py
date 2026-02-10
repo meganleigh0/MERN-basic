@@ -1,25 +1,10 @@
 # ============================================================
-# EVMS PIPELINE (ONE CELL) — hardened against your current error:
-#   ValueError: Grouper for '<class pandas.core.frame.DataFrame>' not 1-dimensional
-#
-# Root cause (typical): calling groupby() with a DataFrame as the "by" argument
-# (e.g., groupby(out[keys]) where out[keys] is a DataFrame). Some pandas versions
-# allow it in some cases, others throw exactly this error.
-#
-# FIX: ALWAYS groupby(keys) where keys is a list of column names, NOT a DF slice.
-# Also avoids DatetimeArray .values issues + dtype promotion issues.
-#
-# INPUT:  cobra_merged_df  (must include PROGRAM, SUB_TEAM, COST_SET, DATE, HOURS)
-# OUTPUT: program_overview_evms, subteam_spi_cpi, subteam_bac_eac_vac,
-#         program_hours_forecast, issues
+# EVMS PIPELINE (ONE CELL) — fixes "datetime64 values must have a unit specified"
 # ============================================================
 
 import pandas as pd
 import numpy as np
 
-# ----------------------------
-# helpers
-# ----------------------------
 def _to_dt(x):
     return pd.to_datetime(x, errors="coerce")
 
@@ -35,7 +20,6 @@ def _safe_div(a, b):
 def _std_cols(df):
     d = df.copy()
     d.columns = [c.strip().upper().replace(" ", "_").replace("-", "_") for c in d.columns]
-    # aliases
     if "COST_SET" not in d.columns and "COSTSET" in d.columns:
         d["COST_SET"] = d["COSTSET"]
     if "SUBTEAM" in d.columns and "SUB_TEAM" not in d.columns:
@@ -48,59 +32,54 @@ def _map_bucket(cost_set):
     s = cost_set.astype(str).str.strip().str.upper()
     out = pd.Series(pd.NA, index=s.index, dtype="object")
 
-    # exact
     out.loc[s.eq("BCWS")] = "BCWS"
     out.loc[s.eq("BCWP")] = "BCWP"
     out.loc[s.eq("ACWP")] = "ACWP"
     out.loc[s.eq("ETC")]  = "ETC"
 
-    # variants (strings)
-    out.loc[out.isna() & s.str.contains(r"\bBUDGET\b", regex=True)] = "BCWS"
+    out.loc[out.isna() & s.str.contains(r"\bBUDGET\b", regex=True)]   = "BCWS"
     out.loc[out.isna() & s.str.contains(r"\bPROGRESS\b", regex=True)] = "BCWP"
+
     out.loc[out.isna() & s.str.contains(r"\bBCWS\b", regex=True)] = "BCWS"
     out.loc[out.isna() & s.str.contains(r"\bBCWP\b", regex=True)] = "BCWP"
     out.loc[out.isna() & s.str.contains(r"\bACWP\b", regex=True)] = "ACWP"
-    out.loc[out.isna() & s.str.contains(r"\bETC\b", regex=True)]  = "ETC"
+    out.loc[out.isna() & s.str.contains(r"\bETC\b",  regex=True)] = "ETC"
 
     return out
 
+def _infer_period_ends_from_data(df):
+    return sorted(df["DATE"].dt.normalize().dropna().unique())
+
 def _assign_period_end(dates, period_ends):
-    """
-    For each DATE, assign to the first period_end >= DATE.
-    """
     d = _to_dt(dates)
     pe = pd.Series(_to_dt(period_ends)).dropna().sort_values().unique()
-    pe_arr = np.asarray(pe, dtype="datetime64[ns]")   # no .values on DatetimeArray
-    if pe_arr.size == 0:
+    if len(pe) == 0:
         return pd.to_datetime(pd.Series([pd.NaT] * len(d), index=d.index))
 
+    pe_arr = np.asarray(pe, dtype="datetime64[ns]")
     arr = np.asarray(d, dtype="datetime64[ns]")
     idx = np.searchsorted(pe_arr, arr, side="left")
 
     out = pd.Series(pd.NaT, index=d.index, dtype="datetime64[ns]")
-    m = (~pd.isna(d)) & (idx >= 0) & (idx < pe_arr.size)
+    m = (~pd.isna(d)) & (idx >= 0) & (idx < len(pe_arr))
     out.loc[m] = pe_arr[idx[m]]
     return pd.to_datetime(out)
 
-def _infer_period_ends_from_data(df):
-    # best effort if you don't pass the official calendar: use unique dates
-    return sorted(df["DATE"].dt.normalize().dropna().unique())
+def _last_nonnull(s):
+    s2 = s.dropna()
+    return s2.iloc[-1] if len(s2) else np.nan
 
 def _add_cums_and_ratios(period_df, keys):
-    """
-    period_df has columns: keys + PERIOD_END + BCWS/BCWP/ACWP/ETC
-    keys is list[str] of column names
-    """
     out = period_df.sort_values(keys + ["PERIOD_END"]).copy()
-
-    # IMPORTANT: groupby(keys) NOT groupby(out[keys]) to avoid the error you have
-    g = out.groupby(keys, dropna=False)
 
     for col in ["BCWS", "BCWP", "ACWP", "ETC"]:
         if col not in out.columns:
             out[col] = np.nan
         out[col] = _num(out[col])
 
+    g = out.groupby(keys, dropna=False)  # <-- keys is list[str], not a DF slice
+
+    # use groupby.apply -> align back safely
     out["BCWS_CUM"] = g["BCWS"].apply(lambda s: s.fillna(0).cumsum()).reset_index(level=list(range(len(keys))), drop=True)
     out["BCWP_CUM"] = g["BCWP"].apply(lambda s: s.fillna(0).cumsum()).reset_index(level=list(range(len(keys))), drop=True)
     out["ACWP_CUM"] = g["ACWP"].apply(lambda s: s.fillna(0).cumsum()).reset_index(level=list(range(len(keys))), drop=True)
@@ -112,13 +91,6 @@ def _add_cums_and_ratios(period_df, keys):
     out["CPI_CTD"] = _safe_div(out["BCWP_CUM"], out["ACWP_CUM"])
     return out
 
-def _last_nonnull(s):
-    s2 = s.dropna()
-    return s2.iloc[-1] if len(s2) else np.nan
-
-# ----------------------------
-# main
-# ----------------------------
 def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of_date=None, debug_program=None):
     issues = []
     df0 = _std_cols(cobra_merged_df)
@@ -163,7 +135,6 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
 
     df = df.dropna(subset=["PERIOD_END"]).copy()
 
-    # Aggregate to period totals
     period_prog = (
         df.groupby(["PROGRAM", "PERIOD_END", "EVMS_BUCKET"], dropna=False)["HOURS"]
           .sum()
@@ -177,17 +148,14 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
           .reset_index()
     )
 
-    # Ensure columns exist
     for col in ["BCWS", "BCWP", "ACWP", "ETC"]:
         if col not in period_prog.columns: period_prog[col] = np.nan
         if col not in period_sub.columns:  period_sub[col]  = np.nan
 
-    # Add cum + ratios (this is where your error was happening)
     period_prog = _add_cums_and_ratios(period_prog, keys=["PROGRAM"])
     period_sub  = _add_cums_and_ratios(period_sub,  keys=["PROGRAM", "SUB_TEAM"])
 
-    # LSD selection = last PERIOD_END <= as_of
-    # (per program; if none <= as_of, use last available)
+    # LSD per program
     lsd_by_program = {}
     for prog, g in period_prog.groupby("PROGRAM", dropna=False):
         g = g.sort_values("PERIOD_END")
@@ -195,9 +163,9 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
         pe_le = pe[pe <= as_of]
         lsd_by_program[prog] = pe_le[-1] if len(pe_le) else (pe[-1] if len(pe) else pd.NaT)
 
-    # Next period lookup
+    # Prepare sorted period_ends as pandas Timestamps (NO unit-less np.datetime64)
     pe_sorted = pd.Series(_to_dt(period_ends)).dropna().sort_values().unique()
-    pe_arr = np.asarray(pe_sorted, dtype="datetime64[ns]")
+    pe_sorted = pd.to_datetime(pe_sorted)
 
     # Program overview
     rows = []
@@ -206,25 +174,32 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
         if g.empty:
             continue
 
-        lsd_end = lsd_by_program.get(prog, pd.NaT)
+        lsd_end = pd.to_datetime(lsd_by_program.get(prog, pd.NaT))
         lsd_row = g[g["PERIOD_END"] == lsd_end].tail(1)
         if lsd_row.empty:
             lsd_row = g.tail(1)
-            lsd_end = lsd_row["PERIOD_END"].iloc[0]
+            lsd_end = pd.to_datetime(lsd_row["PERIOD_END"].iloc[0])
         lsd_row = lsd_row.iloc[0]
 
-        # fallback for SPI/CPI LSD if NaN
         spi_lsd = lsd_row["SPI_LSD"]
         cpi_lsd = lsd_row["CPI_LSD"]
         if pd.isna(spi_lsd): spi_lsd = _last_nonnull(g["SPI_LSD"])
         if pd.isna(cpi_lsd): cpi_lsd = _last_nonnull(g["CPI_LSD"])
 
-        # next period end
-        lsd64 = np.asarray([np.datetime64(pd.to_datetime(lsd_end))], dtype="datetime64[ns]")[0]
-        idxs = np.where(pe_arr == lsd64)[0]
-        next_end = pe_arr[idxs[0] + 1] if (len(idxs) and idxs[0] + 1 < len(pe_arr)) else np.datetime64("NaT")
-        next_row = g[np.asarray(g["PERIOD_END"], dtype="datetime64[ns]") == next_end].tail(1)
+        # next period end (safe)
+        next_end = pd.NaT
+        if pd.notna(lsd_end) and len(pe_sorted) > 0:
+            # find exact match index, else next by searchsorted
+            pos = np.searchsorted(pe_sorted, lsd_end)
+            if pos < len(pe_sorted) and pe_sorted[pos] == lsd_end:
+                if pos + 1 < len(pe_sorted):
+                    next_end = pe_sorted[pos + 1]
+            else:
+                # lsd_end might not be in calendar; choose first period_end > lsd_end
+                if pos < len(pe_sorted):
+                    next_end = pe_sorted[pos]
 
+        next_row = g[g["PERIOD_END"] == next_end].tail(1)
         next_bcws = float(next_row["BCWS"].iloc[0]) if len(next_row) else np.nan
         next_etc  = float(next_row["ETC"].iloc[0])  if len(next_row) else np.nan
 
@@ -253,11 +228,10 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
 
     program_overview_evms = pd.DataFrame(rows).sort_values("PROGRAM").reset_index(drop=True)
 
-    # Subteam SPI/CPI table (take rows at program LSD)
+    # Subteam SPI/CPI (LSD)
     period_sub["LAST_STATUS_PERIOD_END"] = period_sub["PROGRAM"].map(lsd_by_program)
     sub_lsd = period_sub[period_sub["PERIOD_END"] == period_sub["LAST_STATUS_PERIOD_END"]].copy()
 
-    # fallback SPI/CPI LSD within each (program,sub_team)
     if not period_sub.empty:
         fb = (
             period_sub.sort_values(["PROGRAM","SUB_TEAM","PERIOD_END"])
@@ -278,7 +252,7 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
     else:
         subteam_spi_cpi = pd.DataFrame(columns=["PROGRAM","SUB_TEAM","LAST_STATUS_PERIOD_END","SPI_LSD","SPI_CTD","CPI_LSD","CPI_CTD"])
 
-    # BAC/EAC/VAC by subteam (at LSD)
+    # BAC/EAC/VAC by subteam
     if not sub_lsd.empty:
         sub_lsd["BAC_HRS"] = sub_lsd["BCWS_CUM"]
         sub_lsd["EAC_HRS"] = sub_lsd["ACWP_CUM"] + sub_lsd["ETC"]
@@ -287,7 +261,7 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
     else:
         subteam_bac_eac_vac = pd.DataFrame(columns=["PROGRAM","SUB_TEAM","BAC_HRS","EAC_HRS","VAC_HRS"])
 
-    # Program hours forecast (based on CTD)
+    # Program hours forecast
     if not program_overview_evms.empty:
         phf = program_overview_evms.copy()
         phf["DEMAND_HRS_CTD"] = phf["BCWS_CTD"]
@@ -306,7 +280,7 @@ def build_evms_tables(cobra_merged_df, period_ends=None, year_filter=None, as_of
             "NEXT_PERIOD_BCWS_HRS","NEXT_PERIOD_ETC_HRS","NEXT_PERIOD_N"
         ])
 
-    # Debug prints (optional)
+    # Optional deep debug
     if debug_program is not None:
         p = str(debug_program).strip()
         print(f"\n=== DEBUG PROGRAM: {p} ===")
@@ -338,7 +312,7 @@ program_overview_evms, subteam_spi_cpi, subteam_bac_eac_vac, program_hours_forec
     period_ends=PERIOD_ENDS_2026,
     year_filter=2026,
     as_of_date=None,
-    debug_program=None,  # set to "ABRAMS_22" to print deep debug
+    debug_program=None,   # set "ABRAMS_22" to print deep debug
 )
 
 print("ISSUES:")
