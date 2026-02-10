@@ -8,19 +8,14 @@ DISTINCT(
     )
 )
 
-PO CTD Color =
-VAR metric = SELECTEDVALUE ( Program_Overview[Metric] )
-VAR v0     = SELECTEDVALUE ( Program_Overview[CTD] )
-VAR v      = ROUND ( v0, 2 )
+Color_SPI_CTD =
+VAR x = SELECTEDVALUE(Program_Overview[CTD])
 RETURN
-SWITCH (
+SWITCH(
     TRUE(),
-    ISBLANK(v), BLANK(),
-
-    metric IN { "SPI", "CPI" } && v >= 1.05, "#8EB4E3",
-    metric IN { "SPI", "CPI" } && v >= 0.98, "#339966",
-    metric IN { "SPI", "CPI" } && v >= 0.95, "#FFFF99",
-    metric IN { "SPI", "CPI" },                "#C0504D",
-
-    BLANK()
+    ISBLANK(x), BLANK(),
+    x >= 1.05, "#8EB4E3",
+    x >= 0.98, "#339966",
+    x >= 0.95, "#FFFF99",
+    "#C0504D"
 )
