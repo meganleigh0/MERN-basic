@@ -379,3 +379,4 @@ def debug_program(cobra_merged_df: pd.DataFrame, program: str, year_filter: int 
     raw_last = d[d["PERIOD_END"] == last_pe][["DATE","COST_SET","EVMS_BUCKET","HOURS","SUB_TEAM"]].sort_values("DATE").tail(nrows)
     print(f"\nRaw rows in last period (last {nrows}):")
     display(raw_last)
+    
