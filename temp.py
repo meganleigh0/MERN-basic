@@ -1,252 +1,519 @@
-import os
+# ============================================================
+# EVMS -> PowerBI Excel (ONE CELL, FIXED)  ✅ BCWS scaling fix
+# - Hardcodes 4 programs
+# - As-of = last Thursday of previous month (relative to TODAY)
+# - LSD FIX: compute LSD per COST_SET using latest available DATE <= AS_OF_DATE for that key
+# - Program Overview: SPI + CPI ONLY (NO BEI)
+# - Preserves user comments if Excel already exists
+# - Writes ONE Excel with 4 sheets, EXACT headers
+# - FIX: scale BCWS by 2.0 so SPI doesn't start near ~2.0
+# ============================================================
+
+import os, re
+from pathlib import Path
+from datetime import date, datetime, timedelta
 import numpy as np
 import pandas as pd
-from pathlib import Path
 
-# =========================
-# EXPECTED INPUT DATAFRAMES (already in your notebook):
-#   program_overview
-#   subteam_spi_cpi
-#   subteam_bac_eac_vac
-#   program_manpower
-# =========================
+# -------------------------
+# SETTINGS
+# -------------------------
+PROGRAMS_KEEP = ["ABRAMS_22", "OLYMPUS", "STRYKER_BULG", "XM30"]
+TODAY_OVERRIDE = None  # e.g. "2026-02-10" for testing
+OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")
 
-# --------- Output locations (edit if you want) ----------
-OUTPUT_DIR = Path.cwd()  # current notebook folder
-OUTPUT_XLSX = OUTPUT_DIR / "EVMS_PowerBI_Input.xlsx"
+# 🔧 KEY FIX:
+# If your status period represents 2 weeks of BCWP/ACWP but BCWS is effectively 1-week,
+# SPI = BCWP/BCWS inflates (~2x). Scale BCWS up everywhere it's used.
+BCWS_SCALE_FACTOR = 2.0
 
-TSV_DIR = OUTPUT_DIR / "tsv_exports"
-TSV_DIR.mkdir(parents=True, exist_ok=True)
+# Optional: if you want this scaling only when period is "2 weeks", keep it hardcoded to 2.0.
+# Otherwise set to 1.0.
 
-# --------- Color palette (from your GDLS threshold key) ----------
-HEX_DARK_BLUE = "#1F497D"  # RGB 31,73,125 (rarely used in thresholds; kept for completeness)
-HEX_LIGHT_BLUE = "#8EB4E3" # RGB 142,180,227
-HEX_GREEN = "#339966"      # RGB 51,153,102
-HEX_YELLOW = "#FFFF99"     # RGB 255,255,153
-HEX_RED = "#C0504D"        # RGB 192,80,77
+FORCE_READ_FILES = False
+INPUT_FILES = []  # optional explicit list of csv/xlsx; if empty, auto-discover or use in-memory df
 
-# --------- Helpers ----------
-def _to_num(s):
-    """Coerce to numeric, preserve NaN."""
-    return pd.to_numeric(s, errors="coerce")
+# -------------------------
+# HELPERS
+# -------------------------
+def normalize_key(s):
+    if pd.isna(s):
+        return None
+    s = str(s).strip().upper()
+    s = re.sub(r"\s+", " ", s)
+    s = s.replace("-", " ").replace("_", " ")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 
-def _clean_str(s):
-    return s.astype(str).str.strip()
+def normalize_cost_set(s):
+    if pd.isna(s):
+        return None
+    s = str(s).strip().upper()
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("-", "").replace("_", "")
+    aliases = {
+        "BCWS": "BCWS",
+        "BCWP": "BCWP",
+        "ACWP": "ACWP",
+        "ETC":  "ETC",
+        "EAC":  "EAC",
+        "BAC":  "BAC",
+        "VAC":  "VAC",
+    }
+    return aliases.get(s, s)
 
-def spi_cpi_color(x):
-    """
-    SPI/CPI thresholds (same for LSD/CTD):
-      x >= 1.05  -> Light Blue
-      x >= 0.98  -> Green
-      x >= 0.95  -> Yellow
-      else       -> Red
-    """
-    if pd.isna(x):
-        return np.nan
+def safe_div(a, b):
+    a = pd.to_numeric(a, errors="coerce")
+    b = pd.to_numeric(b, errors="coerce")
+    return np.where((b == 0) | pd.isna(b), np.nan, a / b)
+
+def _to_date(x):
+    if x is None or (isinstance(x, float) and np.isnan(x)):
+        return None
+    if isinstance(x, (datetime, pd.Timestamp)):
+        return x.date()
+    if isinstance(x, date):
+        return x
+    return pd.to_datetime(x, errors="coerce").date()
+
+def last_thursday_of_month(year: int, month: int) -> date:
+    if month == 12:
+        last = date(year, 12, 31)
+    else:
+        last = date(year, month + 1, 1) - timedelta(days=1)
+    offset = (last.weekday() - 3) % 7  # Thu=3
+    return last - timedelta(days=offset)
+
+def last_thursday_prev_month(d: date) -> date:
+    y, m = d.year, d.month
+    if m == 1:
+        y, m = y - 1, 12
+    else:
+        m -= 1
+    return last_thursday_of_month(y, m)
+
+def add_month(d: date, months: int = 1) -> date:
+    y, m = d.year, d.month + months
+    while m > 12:
+        y += 1
+        m -= 12
+    while m < 1:
+        y -= 1
+        m += 12
+    # clamp day
+    if m == 12:
+        last_day = 31
+    else:
+        last_day = (date(y, m + 1, 1) - timedelta(days=1)).day
+    return date(y, m, min(d.day, last_day))
+
+def coerce_columns(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    colmap = {c: str(c).strip().upper().replace(" ", "_").replace("-", "_") for c in df.columns}
+    df.rename(columns=colmap, inplace=True)
+
+    # PROGRAM
+    if "PROGRAM" not in df.columns:
+        for c in ["PROGRAMID", "PROG", "PROJECT", "IPT_PROGRAM"]:
+            if c in df.columns:
+                df.rename(columns={c: "PROGRAM"}, inplace=True)
+                break
+
+    # SUB_TEAM
+    if "SUB_TEAM" not in df.columns:
+        for c in ["SUBTEAM", "SUB_TEAM_NAME", "IPT", "IPT_NAME", "CONTROL_ACCOUNT", "CA", "SUBTEAM_NAME"]:
+            if c in df.columns:
+                df.rename(columns={c: "SUB_TEAM"}, inplace=True)
+                break
+
+    # DATE
+    if "DATE" not in df.columns:
+        for c in ["PERIOD_END", "PERIODEND", "STATUS_DATE", "AS_OF_DATE"]:
+            if c in df.columns:
+                df.rename(columns={c: "DATE"}, inplace=True)
+                break
+
+    # COST_SET
+    if "COST_SET" not in df.columns:
+        for c in ["COSTSET", "COST-SET", "COST_SET_NAME", "COST_CATEGORY"]:
+            if c in df.columns:
+                df.rename(columns={c: "COST_SET"}, inplace=True)
+                break
+
+    # HOURS / VALUE
+    if "HOURS" not in df.columns:
+        for c in ["VALUE", "AMOUNT", "HRS", "HOURS_WORKED", "TOTAL_HOURS"]:
+            if c in df.columns:
+                df.rename(columns={c: "HOURS"}, inplace=True)
+                break
+
+    required = ["PROGRAM", "SUB_TEAM", "DATE", "COST_SET", "HOURS"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns {missing}. Found: {list(df.columns)}")
+
+    df["PROGRAM"]  = df["PROGRAM"].map(normalize_key)
+    df["SUB_TEAM"] = df["SUB_TEAM"].map(normalize_key)
+    df["COST_SET"] = df["COST_SET"].map(normalize_cost_set)
+    df["DATE"]     = pd.to_datetime(df["DATE"], errors="coerce").dt.date
+    df["HOURS"]    = pd.to_numeric(df["HOURS"], errors="coerce")
+
+    df = df.dropna(subset=["PROGRAM", "SUB_TEAM", "DATE", "COST_SET", "HOURS"])
+    return df
+
+def load_inputs() -> pd.DataFrame:
+    # 1) Prefer in-memory df if present (unless FORCE_READ_FILES)
+    if not FORCE_READ_FILES:
+        for name in ["cobra_merged_df", "cobra_df", "df", "raw_df"]:
+            if name in globals() and isinstance(globals()[name], pd.DataFrame) and len(globals()[name]) > 0:
+                return coerce_columns(globals()[name])
+
+    # 2) Otherwise read from INPUT_FILES or auto-discover
+    files = list(INPUT_FILES)
+    if not files:
+        candidates = []
+        for pat in ["*.csv", "*.xlsx", "*.xls"]:
+            candidates += list(Path(".").glob(pat))
+        # Prefer cobra files
+        candidates = sorted(candidates, key=lambda p: ("cobra" not in p.name.lower(), p.name.lower()))
+        files = [str(p) for p in candidates[:30]]
+
+    if not files:
+        raise FileNotFoundError("No input files found and no in-memory dataframe (cobra_merged_df/df/...) found.")
+
+    frames = []
+    for fp in files:
+        p = Path(fp)
+        if not p.exists():
+            continue
+        if p.suffix.lower() == ".csv":
+            frames.append(pd.read_csv(p))
+        elif p.suffix.lower() in [".xlsx", ".xls"]:
+            xls = pd.ExcelFile(p)
+            for sh in xls.sheet_names:
+                frames.append(pd.read_excel(p, sheet_name=sh))
+    if not frames:
+        raise FileNotFoundError("No readable input data found from INPUT_FILES / auto-discovery.")
+
+    return coerce_columns(pd.concat(frames, ignore_index=True))
+
+def pivot_costsets(df: pd.DataFrame, idx_cols, val_col):
+    if df.empty:
+        out = df[idx_cols].drop_duplicates().copy()
+        for cs in NEEDED_COSTSETS:
+            out[cs] = np.nan
+        return out
+    pv = df.pivot_table(index=idx_cols, columns="COST_SET", values=val_col, aggfunc="sum").reset_index()
+    for cs in NEEDED_COSTSETS:
+        if cs not in pv.columns:
+            pv[cs] = np.nan
+    return pv
+
+def preserve_comments(existing_path: Path, sheet: str, df_new: pd.DataFrame, key_cols, comment_col):
+    # keeps existing non-empty comments if file/sheet exists
+    if (not existing_path.exists()) or (comment_col not in df_new.columns):
+        return df_new
     try:
-        x = float(x)
+        old = pd.read_excel(existing_path, sheet_name=sheet)
     except Exception:
-        return np.nan
-    if x >= 1.05:
-        return HEX_LIGHT_BLUE
-    if x >= 0.98:
-        return HEX_GREEN
-    if x >= 0.95:
-        return HEX_YELLOW
-    return HEX_RED
+        return df_new
+    if old is None or len(old) == 0:
+        return df_new
+    if (comment_col not in old.columns) or (not all(k in old.columns for k in key_cols)):
+        return df_new
 
-def vac_bac_color(r):
-    """
-    VAC/BAC thresholds (ratio, not percent):
-      r >= +0.05                    -> Light Blue
-      +0.05 > r >= -0.02            -> Green
-      -0.02 > r >= -0.05            -> Yellow
-      r < -0.05                     -> Red
-    """
-    if pd.isna(r):
-        return np.nan
-    try:
-        r = float(r)
-    except Exception:
-        return np.nan
-    if r >= 0.05:
-        return HEX_LIGHT_BLUE
-    if r >= -0.02:
-        return HEX_GREEN
-    if r >= -0.05:
-        return HEX_YELLOW
-    return HEX_RED
+    old = old[key_cols + [comment_col]].copy()
+    old = old.dropna(subset=key_cols)
+    old = old.rename(columns={comment_col: f"{comment_col}_old"})
 
-def manpower_color(p):
-    """
-    Program manpower thresholds are on % (e.g., 110%, 105%, 90%, 85%).
-    Your Program_Manpower table shows '% Var' like 94.67, 111.71, etc.
-    We'll accept:
-      - 0.9467 (ratio) OR 94.67 (percent)
-    Convert to percent points internally.
-      >=110% -> Red
-      110> x >=105 -> Yellow
-      105> x >=90  -> Green
-      90>  x >=85  -> Yellow
-      <85% -> Red
-    """
-    if pd.isna(p):
-        return np.nan
-    try:
-        p = float(p)
-    except Exception:
-        return np.nan
-
-    # Normalize: if it's a ratio (0-2), turn into percent
-    if p <= 2.0:
-        p = p * 100.0
-
-    if p >= 110.0:
-        return HEX_RED
-    if p >= 105.0:
-        return HEX_YELLOW
-    if p >= 90.0:
-        return HEX_GREEN
-    if p >= 85.0:
-        return HEX_YELLOW
-    return HEX_RED
-
-# =========================
-# 0) Validate expected dataframes exist
-# =========================
-missing = [name for name in ["program_overview","subteam_spi_cpi","subteam_bac_eac_vac","program_manpower"] if name not in globals()]
-if missing:
-    raise NameError(f"Missing dataframe(s) in memory: {missing}. Make sure you ran the cell that creates them first.")
-
-# Work on copies (avoid mutating originals unexpectedly)
-program_overview = program_overview.copy()
-subteam_spi_cpi = subteam_spi_cpi.copy()
-subteam_bac_eac_vac = subteam_bac_eac_vac.copy()
-program_manpower = program_manpower.copy()
-
-# =========================
-# 1) Program_Overview (NO BEI)
-# Expected cols: ProgramID, Metric, CTD, LSD, (optional) Comments/Root Cause...
-# =========================
-# Normalize key string columns
-if "ProgramID" in program_overview.columns:
-    program_overview["ProgramID"] = _clean_str(program_overview["ProgramID"])
-if "Metric" in program_overview.columns:
-    program_overview["Metric"] = _clean_str(program_overview["Metric"]).str.upper()
-
-# Coerce numeric
-for c in ["CTD", "LSD"]:
-    if c in program_overview.columns:
-        program_overview[c] = _to_num(program_overview[c])
-
-# Drop BEI rows if they exist
-if "Metric" in program_overview.columns:
-    program_overview = program_overview[program_overview["Metric"].isin(["SPI","CPI"])].copy()
-
-# Add color columns for CTD/LSD (SPI/CPI use same thresholds)
-if "CTD" in program_overview.columns:
-    program_overview["Color_CTD"] = program_overview["CTD"].map(spi_cpi_color)
-if "LSD" in program_overview.columns:
-    program_overview["Color_LSD"] = program_overview["LSD"].map(spi_cpi_color)
-
-# =========================
-# 2) SubTeam_SPI_CPI
-# Expected cols: ProgramID, SubTeam, SPI LSD, SPI CTD, CPI LSD, CPI CTD, (optional) Cause/Comments...
-# =========================
-for c in ["ProgramID","SubTeam"]:
-    if c in subteam_spi_cpi.columns:
-        subteam_spi_cpi[c] = _clean_str(subteam_spi_cpi[c])
-
-for c in ["SPI LSD","SPI CTD","CPI LSD","CPI CTD"]:
-    if c in subteam_spi_cpi.columns:
-        subteam_spi_cpi[c] = _to_num(subteam_spi_cpi[c])
-
-# Add color columns
-if "SPI LSD" in subteam_spi_cpi.columns:
-    subteam_spi_cpi["Color_SPI_LSD"] = subteam_spi_cpi["SPI LSD"].map(spi_cpi_color)
-if "SPI CTD" in subteam_spi_cpi.columns:
-    subteam_spi_cpi["Color_SPI_CTD"] = subteam_spi_cpi["SPI CTD"].map(spi_cpi_color)
-if "CPI LSD" in subteam_spi_cpi.columns:
-    subteam_spi_cpi["Color_CPI_LSD"] = subteam_spi_cpi["CPI LSD"].map(spi_cpi_color)
-if "CPI CTD" in subteam_spi_cpi.columns:
-    subteam_spi_cpi["Color_CPI_CTD"] = subteam_spi_cpi["CPI CTD"].map(spi_cpi_color)
-
-# =========================
-# 3) SubTeam_BAC_EAC_VAC
-# Expected cols: ProgramID, SubTeam, BAC, EAC, VAC, (optional) Cause/Comments...
-# Add VAC/BAC + Color_VAC_BAC
-# =========================
-for c in ["ProgramID","SubTeam"]:
-    if c in subteam_bac_eac_vac.columns:
-        subteam_bac_eac_vac[c] = _clean_str(subteam_bac_eac_vac[c])
-
-for c in ["BAC","EAC","VAC"]:
-    if c in subteam_bac_eac_vac.columns:
-        subteam_bac_eac_vac[c] = _to_num(subteam_bac_eac_vac[c])
-
-# Compute VAC/BAC safely
-if "VAC" in subteam_bac_eac_vac.columns and "BAC" in subteam_bac_eac_vac.columns:
-    denom = subteam_bac_eac_vac["BAC"].replace({0: np.nan})
-    subteam_bac_eac_vac["VAC/BAC"] = subteam_bac_eac_vac["VAC"] / denom
-    subteam_bac_eac_vac["Color_VAC_BAC"] = subteam_bac_eac_vac["VAC/BAC"].map(vac_bac_color)
-
-# =========================
-# 4) Program_Manpower
-# Expected cols: ProgramID, Demand Hours, Actual Hours, % Var, Next Mo BCWS Hours, Next Mo ETC Hours, (optional) Cause/Comments...
-# Add PctVar + Color_PctVar
-# =========================
-if "ProgramID" in program_manpower.columns:
-    program_manpower["ProgramID"] = _clean_str(program_manpower["ProgramID"])
-
-for c in ["Demand Hours","Actual Hours","% Var","Next Mo BCWS Hours","Next Mo ETC Hours"]:
-    if c in program_manpower.columns:
-        program_manpower[c] = _to_num(program_manpower[c])
-
-# If % Var is missing but demand/actual exist, compute it as (Actual/Demand)*100
-if "% Var" not in program_manpower.columns and {"Demand Hours","Actual Hours"}.issubset(program_manpower.columns):
-    denom = program_manpower["Demand Hours"].replace({0: np.nan})
-    program_manpower["% Var"] = (program_manpower["Actual Hours"] / denom) * 100.0
-
-# Normalized helper + color
-if "% Var" in program_manpower.columns:
-    program_manpower["PctVar"] = program_manpower["% Var"]
-    program_manpower["Color_PctVar"] = program_manpower["PctVar"].map(manpower_color)
-
-# =========================
-# 5) Quick missingness check (key numeric cols)
-# =========================
-def miss(df, cols):
-    out = {}
-    for c in cols:
-        if c in df.columns:
-            out[c] = float(df[c].isna().mean())
+    out = df_new.merge(old, on=key_cols, how="left")
+    if f"{comment_col}_old" in out.columns:
+        out[comment_col] = out[comment_col].astype("object")
+        oldvals = out[f"{comment_col}_old"]
+        # prefer old if non-empty
+        mask = oldvals.notna() & (oldvals.astype(str).str.strip() != "")
+        out.loc[mask, comment_col] = oldvals.loc[mask]
+        out = out.drop(columns=[f"{comment_col}_old"])
     return out
 
-print("Quick missingness check:")
-print("Program_Overview:", miss(program_overview, ["CTD","LSD"]))
-print("SubTeam_SPI_CPI:", miss(subteam_spi_cpi, ["SPI LSD","SPI CTD","CPI LSD","CPI CTD"]))
-print("SubTeam_BAC_EAC_VAC:", miss(subteam_bac_eac_vac, ["BAC","EAC","VAC","VAC/BAC"]))
-print("Program_Manpower:", miss(program_manpower, ["Demand Hours","Actual Hours","% Var","Next Mo BCWS Hours","Next Mo ETC Hours"]))
+# -------------------------
+# LOAD + FILTER
+# -------------------------
+base = load_inputs()
+base = base[base["PROGRAM"].isin([normalize_key(p) for p in PROGRAMS_KEEP])].copy()
 
-# =========================
-# 6) Export Excel + TSV (tab-separated)
-# =========================
+# -------------------------
+# AS-OF / NEXT PERIOD
+# -------------------------
+today = _to_date(TODAY_OVERRIDE) if TODAY_OVERRIDE else date.today()
+AS_OF_DATE = last_thursday_prev_month(today)
+month_after = add_month(AS_OF_DATE, 1)
+NEXT_PERIOD_END = last_thursday_of_month(month_after.year, month_after.month)
+
+YEAR_FILTER = AS_OF_DATE.year
+YEAR_START = date(YEAR_FILTER, 1, 1)
+YEAR_END = date(YEAR_FILTER, 12, 31)
+
+print("As-of logic")
+print("TODAY:", today)
+print("AS_OF_DATE (last Thu of prev month):", AS_OF_DATE)
+print("NEXT_PERIOD_END (last Thu of next month):", NEXT_PERIOD_END)
+print("YEAR_FILTER:", YEAR_FILTER)
+print("BCWS_SCALE_FACTOR:", BCWS_SCALE_FACTOR)
+
+# -------------------------
+# CORE FILTERS
+# -------------------------
+NEEDED_COSTSETS = ["BCWS", "BCWP", "ACWP", "ETC"]
+
+# For CTD/LSD calculations we only need rows through AS_OF_DATE
+base_to_asof = base[base["DATE"] <= AS_OF_DATE].copy()
+
+# For BAC/year totals, restrict to year window
+base_year = base[(base["DATE"] >= YEAR_START) & (base["DATE"] <= YEAR_END)].copy()
+
+# -------------------------
+# CTD (sum up to AS_OF_DATE)
+# -------------------------
+ctd_sub = (
+    base_to_asof[base_to_asof["COST_SET"].isin(NEEDED_COSTSETS)]
+    .groupby(["PROGRAM", "SUB_TEAM", "COST_SET"], as_index=False)["HOURS"].sum()
+    .rename(columns={"HOURS": "CTD_HRS"})
+)
+
+ctd_prog = (
+    base_to_asof[base_to_asof["COST_SET"].isin(NEEDED_COSTSETS)]
+    .groupby(["PROGRAM", "COST_SET"], as_index=False)["HOURS"].sum()
+    .rename(columns={"HOURS": "CTD_HRS"})
+)
+
+# -------------------------
+# LSD FIX (per COST_SET): latest DATE <= AS_OF_DATE for each key
+# -------------------------
+tmp_sub = base_to_asof[base_to_asof["COST_SET"].isin(NEEDED_COSTSETS)].copy()
+tmp_sub = tmp_sub.sort_values(["PROGRAM", "SUB_TEAM", "COST_SET", "DATE"])
+
+sub_last_date = (
+    tmp_sub.groupby(["PROGRAM", "SUB_TEAM", "COST_SET"], as_index=False)["DATE"].max()
+    .rename(columns={"DATE": "LSD_DATE"})
+)
+
+lsd_sub = (
+    tmp_sub.merge(sub_last_date, on=["PROGRAM", "SUB_TEAM", "COST_SET"], how="inner")
+    .loc[lambda d: d["DATE"] == d["LSD_DATE"]]
+    .groupby(["PROGRAM", "SUB_TEAM", "COST_SET"], as_index=False)["HOURS"].sum()
+    .rename(columns={"HOURS": "LSD_HRS"})
+)
+
+tmp_prog = base_to_asof[base_to_asof["COST_SET"].isin(NEEDED_COSTSETS)].copy()
+tmp_prog = tmp_prog.sort_values(["PROGRAM", "COST_SET", "DATE"])
+
+prog_last_date = (
+    tmp_prog.groupby(["PROGRAM", "COST_SET"], as_index=False)["DATE"].max()
+    .rename(columns={"DATE": "LSD_DATE"})
+)
+
+lsd_prog = (
+    tmp_prog.merge(prog_last_date, on=["PROGRAM", "COST_SET"], how="inner")
+    .loc[lambda d: d["DATE"] == d["LSD_DATE"]]
+    .groupby(["PROGRAM", "COST_SET"], as_index=False)["HOURS"].sum()
+    .rename(columns={"HOURS": "LSD_HRS"})
+)
+
+# -------------------------
+# PIVOT COSTSETS
+# -------------------------
+ctd_sub_p  = pivot_costsets(ctd_sub,  ["PROGRAM", "SUB_TEAM"], "CTD_HRS")
+lsd_sub_p  = pivot_costsets(lsd_sub,  ["PROGRAM", "SUB_TEAM"], "LSD_HRS")
+ctd_prog_p = pivot_costsets(ctd_prog, ["PROGRAM"], "CTD_HRS")
+lsd_prog_p = pivot_costsets(lsd_prog, ["PROGRAM"], "LSD_HRS")
+
+# -------------------------
+# ✅ FIX: SCALE BCWS (denominator for SPI) CONSISTENTLY
+# -------------------------
+for dfp in [ctd_sub_p, lsd_sub_p, ctd_prog_p, lsd_prog_p]:
+    if "BCWS" in dfp.columns:
+        dfp["BCWS"] = pd.to_numeric(dfp["BCWS"], errors="coerce") * float(BCWS_SCALE_FACTOR)
+
+# -------------------------
+# PROGRAM OVERVIEW (SPI + CPI only; NO BEI)
+# EXACT headers:
+# ProgramID | Metric | CTD | LSD | Comments / Root Cause & Corrective Actions
+# -------------------------
+prog = ctd_prog_p.merge(lsd_prog_p, on=["PROGRAM"], how="outer", suffixes=("_CTD", "_LSD"))
+prog = prog.rename(columns={"PROGRAM": "ProgramID"})
+
+# SPI = BCWP / BCWS
+prog_spi_ctd = safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"])
+prog_spi_lsd = safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"])
+# CPI = BCWP / ACWP
+prog_cpi_ctd = safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"])
+prog_cpi_lsd = safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"])
+
+program_overview = pd.concat(
+    [
+        pd.DataFrame({"ProgramID": prog["ProgramID"], "Metric": "SPI", "CTD": prog_spi_ctd, "LSD": prog_spi_lsd}),
+        pd.DataFrame({"ProgramID": prog["ProgramID"], "Metric": "CPI", "CTD": prog_cpi_ctd, "LSD": prog_cpi_lsd}),
+    ],
+    ignore_index=True
+)
+
+comment_col_prog = "Comments / Root Cause & Corrective Actions"
+program_overview[comment_col_prog] = ""
+program_overview = program_overview[["ProgramID", "Metric", "CTD", "LSD", comment_col_prog]]
+program_overview = program_overview.sort_values(["ProgramID", "Metric"]).reset_index(drop=True)
+
+# -------------------------
+# SUBTEAM SPI/CPI
+# EXACT headers:
+# SubTeam | SPI LSD | SPI CTD | CPI LSD | CPI CTD | Cause & Corrective Actions | ProgramID
+# -------------------------
+sub = ctd_sub_p.merge(lsd_sub_p, on=["PROGRAM", "SUB_TEAM"], how="outer", suffixes=("_CTD", "_LSD"))
+sub = sub.rename(columns={"PROGRAM": "ProgramID", "SUB_TEAM": "SubTeam"})
+
+sub_spi_ctd = safe_div(sub["BCWP_CTD"], sub["BCWS_CTD"])
+sub_spi_lsd = safe_div(sub["BCWP_LSD"], sub["BCWS_LSD"])
+sub_cpi_ctd = safe_div(sub["BCWP_CTD"], sub["ACWP_CTD"])
+sub_cpi_lsd = safe_div(sub["BCWP_LSD"], sub["ACWP_LSD"])
+
+subteam_spi_cpi = pd.DataFrame({
+    "SubTeam": sub["SubTeam"],
+    "SPI LSD": sub_spi_lsd,
+    "SPI CTD": sub_spi_ctd,
+    "CPI LSD": sub_cpi_lsd,
+    "CPI CTD": sub_cpi_ctd,
+    "Cause & Corrective Actions": "",
+    "ProgramID": sub["ProgramID"],
+}).sort_values(["ProgramID", "SubTeam"]).reset_index(drop=True)
+
+# -------------------------
+# SUBTEAM BAC/EAC/VAC
+# EXACT headers:
+# SubTeam | BAC | EAC | VAC | Cause & Corrective Actions | ProgramID
+# BAC = YEAR total BCWS  ✅ also scaled
+# EAC = ACWP_CTD + ETC_CTD
+# VAC = BAC - EAC
+# -------------------------
+bcws_year = (
+    base_year[base_year["COST_SET"] == "BCWS"]
+    .groupby(["PROGRAM", "SUB_TEAM"], as_index=False)["HOURS"].sum()
+    .rename(columns={"HOURS": "BAC"})
+)
+bcws_year["BAC"] = pd.to_numeric(bcws_year["BAC"], errors="coerce") * float(BCWS_SCALE_FACTOR)
+
+acwp_ctd = ctd_sub_p[["PROGRAM", "SUB_TEAM", "ACWP"]].rename(columns={"ACWP": "ACWP_CTD"})
+etc_ctd  = ctd_sub_p[["PROGRAM", "SUB_TEAM", "ETC"]].rename(columns={"ETC": "ETC_CTD"})
+
+eac = acwp_ctd.merge(etc_ctd, on=["PROGRAM", "SUB_TEAM"], how="outer")
+eac["ACWP_CTD"] = pd.to_numeric(eac["ACWP_CTD"], errors="coerce").fillna(0.0)
+eac["ETC_CTD"]  = pd.to_numeric(eac["ETC_CTD"],  errors="coerce").fillna(0.0)
+eac["EAC"] = eac["ACWP_CTD"] + eac["ETC_CTD"]
+
+bac_eac = bcws_year.merge(eac[["PROGRAM", "SUB_TEAM", "EAC"]], on=["PROGRAM", "SUB_TEAM"], how="outer")
+bac_eac["BAC"] = pd.to_numeric(bac_eac["BAC"], errors="coerce")
+bac_eac["EAC"] = pd.to_numeric(bac_eac["EAC"], errors="coerce")
+bac_eac["VAC"] = bac_eac["BAC"] - bac_eac["EAC"]
+
+subteam_bac_eac_vac = bac_eac.rename(columns={"PROGRAM": "ProgramID", "SUB_TEAM": "SubTeam"}).copy()
+subteam_bac_eac_vac["Cause & Corrective Actions"] = ""
+subteam_bac_eac_vac = subteam_bac_eac_vac[
+    ["SubTeam", "BAC", "EAC", "VAC", "Cause & Corrective Actions", "ProgramID"]
+].sort_values(["ProgramID", "SubTeam"]).reset_index(drop=True)
+
+# -------------------------
+# PROGRAM MANPOWER (Hours)
+# EXACT headers:
+# ProgramID | Demand Hours | Actual Hours | % Var | Next Mo BCWS Hours | Next Mo ETC Hours | Cause & Corrective Actions
+# Demand = BCWS (CTD)  ✅ already scaled
+# Actual = ACWP (CTD)
+# Next Mo window = (AS_OF_DATE, NEXT_PERIOD_END] for BCWS/ETC (BCWS also scaled)
+# -------------------------
+man = ctd_prog_p.rename(columns={"PROGRAM": "ProgramID", "BCWS": "Demand Hours", "ACWP": "Actual Hours"}).copy()
+man["Demand Hours"] = pd.to_numeric(man["Demand Hours"], errors="coerce")
+man["Actual Hours"] = pd.to_numeric(man["Actual Hours"], errors="coerce")
+man["% Var"] = safe_div(man["Actual Hours"], man["Demand Hours"]) * 100.0
+
+next_window = base[(base["DATE"] > AS_OF_DATE) & (base["DATE"] <= NEXT_PERIOD_END) & (base["COST_SET"].isin(["BCWS", "ETC"]))].copy()
+
+next_prog = (
+    next_window.groupby(["PROGRAM", "COST_SET"], as_index=False)["HOURS"].sum()
+    .pivot_table(index="PROGRAM", columns="COST_SET", values="HOURS", aggfunc="sum")
+    .reset_index()
+)
+
+# Ensure cols exist
+if "BCWS" not in next_prog.columns: next_prog["BCWS"] = np.nan
+if "ETC"  not in next_prog.columns: next_prog["ETC"]  = np.nan
+
+# ✅ scale BCWS in next period too (otherwise your "next mo BCWS hours" mismatches)
+next_prog["BCWS"] = pd.to_numeric(next_prog["BCWS"], errors="coerce") * float(BCWS_SCALE_FACTOR)
+
+next_prog = next_prog.rename(columns={"PROGRAM": "ProgramID", "BCWS": "Next Mo BCWS Hours", "ETC": "Next Mo ETC Hours"})
+
+program_manpower = man.merge(
+    next_prog[["ProgramID", "Next Mo BCWS Hours", "Next Mo ETC Hours"]],
+    on="ProgramID",
+    how="left"
+)
+
+program_manpower["Cause & Corrective Actions"] = ""
+program_manpower = program_manpower[
+    ["ProgramID", "Demand Hours", "Actual Hours", "% Var", "Next Mo BCWS Hours", "Next Mo ETC Hours", "Cause & Corrective Actions"]
+].sort_values(["ProgramID"]).reset_index(drop=True)
+
+# -------------------------
+# PRESERVE EXISTING COMMENTS (if file exists)
+# -------------------------
+program_overview = preserve_comments(
+    OUTPUT_XLSX, "Program_Overview", program_overview,
+    key_cols=["ProgramID", "Metric"], comment_col=comment_col_prog
+)
+
+subteam_spi_cpi = preserve_comments(
+    OUTPUT_XLSX, "SubTeam_SPI_CPI", subteam_spi_cpi,
+    key_cols=["ProgramID", "SubTeam"], comment_col="Cause & Corrective Actions"
+)
+
+subteam_bac_eac_vac = preserve_comments(
+    OUTPUT_XLSX, "SubTeam_BAC_EAC_VAC", subteam_bac_eac_vac,
+    key_cols=["ProgramID", "SubTeam"], comment_col="Cause & Corrective Actions"
+)
+
+program_manpower = preserve_comments(
+    OUTPUT_XLSX, "Program_Manpower", program_manpower,
+    key_cols=["ProgramID"], comment_col="Cause & Corrective Actions"
+)
+
+# -------------------------
+# WRITE ONE EXCEL (PowerBI)
+# -------------------------
 with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
     program_overview.to_excel(writer, sheet_name="Program_Overview", index=False)
     subteam_spi_cpi.to_excel(writer, sheet_name="SubTeam_SPI_CPI", index=False)
     subteam_bac_eac_vac.to_excel(writer, sheet_name="SubTeam_BAC_EAC_VAC", index=False)
     program_manpower.to_excel(writer, sheet_name="Program_Manpower", index=False)
 
-program_overview.to_csv(TSV_DIR / "Program_Overview_withColors.tsv", sep="\t", index=False)
-subteam_spi_cpi.to_csv(TSV_DIR / "SubTeam_SPI_CPI_withColors.tsv", sep="\t", index=False)
-subteam_bac_eac_vac.to_csv(TSV_DIR / "SubTeam_BAC_EAC_VAC_withColors.tsv", sep="\t", index=False)
-program_manpower.to_csv(TSV_DIR / "Program_Manpower_withColors.tsv", sep="\t", index=False)
+print(f"\nSaved: {OUTPUT_XLSX.resolve()}")
 
-print(f"\nSaved Excel: {OUTPUT_XLSX.resolve()}")
-print(f"Saved TSVs:  {TSV_DIR.resolve()}")
+# -------------------------
+# QUICK DIAGNOSTICS (sanity)
+# -------------------------
+def miss_rate(df, cols):
+    out = {}
+    for c in cols:
+        out[c] = float(pd.to_numeric(df[c], errors="coerce").isna().mean()) if c in df.columns else None
+    return out
 
-# Preview
-display(program_overview.head(20))
-display(subteam_spi_cpi.head(20))
-display(subteam_bac_eac_vac.head(20))
-display(program_manpower.head(20))
+print("\nQuick missingness check:")
+print("Program_Overview:", miss_rate(program_overview, ["CTD", "LSD"]))
+print("SubTeam_SPI_CPI:", miss_rate(subteam_spi_cpi, ["SPI LSD", "SPI CTD", "CPI LSD", "CPI CTD"]))
+print("SubTeam_BAC_EAC_VAC:", miss_rate(subteam_bac_eac_vac, ["BAC", "EAC", "VAC"]))
+print("Program_Manpower:", miss_rate(program_manpower, ["Demand Hours", "Actual Hours", "% Var"]))
+
+print("\nSPI range check (Program_Overview):")
+try:
+    spi_rows = program_overview[program_overview["Metric"] == "SPI"].copy()
+    print("SPI CTD min/median/max:", float(np.nanmin(spi_rows["CTD"])), float(np.nanmedian(spi_rows["CTD"])), float(np.nanmax(spi_rows["CTD"])))
+    print("SPI LSD min/median/max:", float(np.nanmin(spi_rows["LSD"])), float(np.nanmedian(spi_rows["LSD"])), float(np.nanmax(spi_rows["LSD"])))
+except Exception as e:
+    print("SPI range check failed:", e)
