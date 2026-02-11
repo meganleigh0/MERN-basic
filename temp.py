@@ -1,12 +1,10 @@
 # ============================================================
 # EVMS -> PowerBI Excel (ONE CELL, FIXED + COLOR COLUMNS)
-# - Hardcodes 4 programs
-# - As-of = last Thursday of previous month (relative to TODAY)
-# - LSD FIX: compute LSD per COST_SET using latest available DATE <= AS_OF_DATE for that key
-# - Program Overview: SPI + CPI ONLY (NO BEI)
-# - Adds *_Color columns for Power BI "Field value" formatting (per PPT thresholds)
-# - Preserves user-entered comments if Excel already exists
-# - Writes ONE Excel with 4 sheets, EXACT headers
+# Updates:
+# - Adds VAC coloring (VAC/BAC thresholds) in SubTeam_BAC_EAC_VAC
+# - Adds % Var coloring (Program Manpower thresholds) in Program_Manpower
+# - Renames SubTeam -> Product Team in outputs
+# - Re-saves ONE Excel with 4 sheets
 # ============================================================
 
 import os, re
@@ -22,11 +20,11 @@ PROGRAMS_KEEP = ["ABRAMS_22", "OLYMPUS", "STRYKER_BULG", "XM30"]
 TODAY_OVERRIDE = None  # e.g. "2026-02-10" for testing
 OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")
 
-# If your BCWP/ACWP represent 2 weeks but BCWS is effectively 1 week, scale BCWS up.
+# If BCWP/ACWP represent 2 weeks but BCWS is effectively 1 week, scale BCWS up.
 BCWS_SCALE_FACTOR = 2.0
 
 FORCE_READ_FILES = False
-INPUT_FILES = []  # optional explicit list of csv/xlsx; if empty, auto-discover or use in-memory df
+INPUT_FILES = []  # optional explicit list; if empty, auto-discover or use in-memory df
 
 # -------------------------
 # GDLS COLOR PALETTE (from PPT)
@@ -41,13 +39,7 @@ CLR_RED        = "#C0504D"  # RGB 192,080,077
 # THRESHOLD FUNCTIONS (match PPT "adjustment for rounding" bands)
 # -------------------------
 def color_spi_cpi_bei(x):
-    """
-    PPT bands (with rounding adjustment text):
-      Blue:   x >= 1.055
-      Green:  1.055 > x >= 0.975
-      Yellow: 0.975 > x >= 0.945
-      Red:    x < 0.945
-    """
+    # Blue: x >= 1.055 | Green: >=0.975 | Yellow: >=0.945 | Red: <0.945
     x = pd.to_numeric(x, errors="coerce")
     if pd.isna(x): return None
     if x >= 1.055: return CLR_LIGHT_BLUE
@@ -55,33 +47,8 @@ def color_spi_cpi_bei(x):
     if x >= 0.945: return CLR_YELLOW
     return CLR_RED
 
-def color_tcpi(x):
-    """
-    PPT bands (with rounding adjustment text):
-      Red:    x >= +0.095
-      Yellow: +0.095 > x >= +0.055
-      Green:  +0.055 > x >  -0.055   (inclusive-ish in PPT shown as +0.05 >= x >= -0.05)
-      Yellow: -0.055 >= x >  -0.095
-      Red:    x <= -0.095
-    """
-    x = pd.to_numeric(x, errors="coerce")
-    if pd.isna(x): return None
-    if x >= 0.095: return CLR_RED
-    if x >= 0.055: return CLR_YELLOW
-    if x > -0.055: return CLR_GREEN
-    if x > -0.095: return CLR_YELLOW
-    return CLR_RED
-
 def color_program_manpower(pct):
-    """
-    PPT PROGRAM MANPOWER THRESHOLDS (with rounding adjustment text):
-      Red:    pct >= 109.5%
-      Yellow: 109.5% > pct >= 105.5%
-      Green:  105.5% > pct >= 89.5%
-      Yellow: 89.5%  > pct >= 85.5%
-      Red:    pct < 85.5%
-    Input 'pct' expected as percent (e.g. 102.0) not ratio.
-    """
+    # Red: >=109.5 | Yellow: >=105.5 | Green: >=89.5 | Yellow: >=85.5 | Red: <85.5
     pct = pd.to_numeric(pct, errors="coerce")
     if pd.isna(pct): return None
     if pct >= 109.5: return CLR_RED
@@ -90,29 +57,13 @@ def color_program_manpower(pct):
     if pct >= 85.5:  return CLR_YELLOW
     return CLR_RED
 
-def color_cdrl(pct):
-    """
-    PPT CDRL THRESHOLDS (with rounding adjustment text):
-      Green: pct >= 99.5%
-      Red:   pct <  99.5%
-    """
-    pct = pd.to_numeric(pct, errors="coerce")
-    if pd.isna(pct): return None
-    return CLR_GREEN if pct >= 99.5 else CLR_RED
-
 def color_vac_over_bac(x):
-    """
-    PPT VAC/BAC THRESHOLDS (with rounding adjustment text):
-      Blue:   x >= +0.055
-      Green:  +0.055 > x >= -0.025
-      Yellow: -0.025 > x >= -0.055
-      Red:    x < -0.055
-    """
+    # Blue: >= +0.055 | Green: >= -0.025 | Yellow: >= -0.055 | Red: < -0.055
     x = pd.to_numeric(x, errors="coerce")
     if pd.isna(x): return None
-    if x >= 0.055: return CLR_LIGHT_BLUE
-    if x >= -0.025: return CLR_GREEN
-    if x >= -0.055: return CLR_YELLOW
+    if x >= 0.055:   return CLR_LIGHT_BLUE
+    if x >= -0.025:  return CLR_GREEN
+    if x >= -0.055:  return CLR_YELLOW
     return CLR_RED
 
 # -------------------------
@@ -215,7 +166,7 @@ def load_inputs() -> pd.DataFrame:
         files = [str(p) for p in candidates[:30]]
 
     if not files:
-        raise FileNotFoundError("No input files found and no in-memory dataframe (cobra_merged_df/df/...) found.")
+        raise FileNotFoundError("No input files found and no in-memory dataframe found (cobra_merged_df/df/...).")
 
     frames = []
     for fp in files:
@@ -233,13 +184,13 @@ def load_inputs() -> pd.DataFrame:
 
     return coerce_columns(pd.concat(frames, ignore_index=True))
 
-def pivot_costsets(df: pd.DataFrame, idx_cols, val_col):
+def pivot_costsets(df: pd.DataFrame, idx_cols, val_col, needed_costsets):
     if df.empty:
         out = df[idx_cols].drop_duplicates().copy()
-        for cs in NEEDED_COSTSETS: out[cs] = np.nan
+        for cs in needed_costsets: out[cs] = np.nan
         return out
     pv = df.pivot_table(index=idx_cols, columns="COST_SET", values=val_col, aggfunc="sum").reset_index()
-    for cs in NEEDED_COSTSETS:
+    for cs in needed_costsets:
         if cs not in pv.columns: pv[cs] = np.nan
     return pv
 
@@ -335,10 +286,10 @@ lsd_prog = (
 # -------------------------
 # PIVOT COSTSETS
 # -------------------------
-ctd_sub_p  = pivot_costsets(ctd_sub,  ["PROGRAM","SUB_TEAM"], "CTD_HRS")
-lsd_sub_p  = pivot_costsets(lsd_sub,  ["PROGRAM","SUB_TEAM"], "LSD_HRS")
-ctd_prog_p = pivot_costsets(ctd_prog, ["PROGRAM"],          "CTD_HRS")
-lsd_prog_p = pivot_costsets(lsd_prog, ["PROGRAM"],          "LSD_HRS")
+ctd_sub_p  = pivot_costsets(ctd_sub,  ["PROGRAM","SUB_TEAM"], "CTD_HRS", NEEDED_COSTSETS)
+lsd_sub_p  = pivot_costsets(lsd_sub,  ["PROGRAM","SUB_TEAM"], "LSD_HRS", NEEDED_COSTSETS)
+ctd_prog_p = pivot_costsets(ctd_prog, ["PROGRAM"],          "CTD_HRS", NEEDED_COSTSETS)
+lsd_prog_p = pivot_costsets(lsd_prog, ["PROGRAM"],          "LSD_HRS", NEEDED_COSTSETS)
 
 # -------------------------
 # BCWS SCALE FIX (keeps SPI from starting near ~2)
@@ -353,10 +304,8 @@ for dfp in [ctd_sub_p, lsd_sub_p, ctd_prog_p, lsd_prog_p]:
 # -------------------------
 prog = ctd_prog_p.merge(lsd_prog_p, on=["PROGRAM"], how="outer", suffixes=("_CTD","_LSD")).rename(columns={"PROGRAM":"ProgramID"})
 
-# SPI = BCWP / BCWS
 prog_spi_ctd = safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"])
 prog_spi_lsd = safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"])
-# CPI = BCWP / ACWP
 prog_cpi_ctd = safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"])
 prog_cpi_lsd = safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"])
 
@@ -367,8 +316,6 @@ program_overview = pd.concat(
     ],
     ignore_index=True
 )
-
-# Color columns for Program Overview (SPI/CPI use same PPT thresholds)
 program_overview["CTD_Color"] = program_overview["CTD"].map(color_spi_cpi_bei)
 program_overview["LSD_Color"] = program_overview["LSD"].map(color_spi_cpi_bei)
 
@@ -379,37 +326,40 @@ program_overview = program_overview[
 ].sort_values(["ProgramID","Metric"]).reset_index(drop=True)
 
 # -------------------------
-# SUBTEAM SPI/CPI
+# PRODUCT TEAM SPI/CPI (renamed from SubTeam)
 # EXACT headers (+ color cols):
-# SubTeam | SPI LSD | SPI CTD | CPI LSD | CPI CTD | SPI LSD Color | SPI CTD Color | CPI LSD Color | CPI CTD Color
+# Product Team | SPI LSD | SPI CTD | CPI LSD | CPI CTD
+# | SPI LSD Color | SPI CTD Color | CPI LSD Color | CPI CTD Color
 # | Cause & Corrective Actions | ProgramID
 # -------------------------
-sub = ctd_sub_p.merge(lsd_sub_p, on=["PROGRAM","SUB_TEAM"], how="outer", suffixes=("_CTD","_LSD")).rename(columns={"PROGRAM":"ProgramID","SUB_TEAM":"SubTeam"})
+sub = ctd_sub_p.merge(lsd_sub_p, on=["PROGRAM","SUB_TEAM"], how="outer", suffixes=("_CTD","_LSD")).rename(columns={"PROGRAM":"ProgramID","SUB_TEAM":"Product Team"})
 
 sub_spi_ctd = safe_div(sub["BCWP_CTD"], sub["BCWS_CTD"])
 sub_spi_lsd = safe_div(sub["BCWP_LSD"], sub["BCWS_LSD"])
 sub_cpi_ctd = safe_div(sub["BCWP_CTD"], sub["ACWP_CTD"])
 sub_cpi_lsd = safe_div(sub["BCWP_LSD"], sub["ACWP_LSD"])
 
-subteam_spi_cpi = pd.DataFrame({
-    "SubTeam": sub["SubTeam"],
+product_team_spi_cpi = pd.DataFrame({
+    "Product Team": sub["Product Team"],
     "SPI LSD": sub_spi_lsd,
     "SPI CTD": sub_spi_ctd,
     "CPI LSD": sub_cpi_lsd,
     "CPI CTD": sub_cpi_ctd,
-    # Color columns for each metric (same SPI/CPI thresholds per PPT)
     "SPI LSD Color": pd.Series(sub_spi_lsd).map(color_spi_cpi_bei),
     "SPI CTD Color": pd.Series(sub_spi_ctd).map(color_spi_cpi_bei),
     "CPI LSD Color": pd.Series(sub_cpi_lsd).map(color_spi_cpi_bei),
     "CPI CTD Color": pd.Series(sub_cpi_ctd).map(color_spi_cpi_bei),
     "Cause & Corrective Actions": "",
     "ProgramID": sub["ProgramID"],
-}).sort_values(["ProgramID","SubTeam"]).reset_index(drop=True)
+}).sort_values(["ProgramID","Product Team"]).reset_index(drop=True)
 
 # -------------------------
-# SUBTEAM BAC/EAC/VAC  (kept, unchanged except BCWS scale consistency)
-# EXACT headers:
-# SubTeam | BAC | EAC | VAC | Cause & Corrective Actions | ProgramID
+# PRODUCT TEAM BAC/EAC/VAC  (VAC coloring added)
+# EXACT headers (+ new):
+# Product Team | BAC | EAC | VAC | VAC_BAC | VAC_Color | Cause & Corrective Actions | ProgramID
+# BAC = YEAR total BCWS (scaled)
+# VAC_BAC = VAC / BAC  (ratio for thresholding)
+# VAC_Color based on VAC/BAC thresholds (PPT)
 # -------------------------
 bcws_year = (
     base_year[base_year["COST_SET"] == "BCWS"]
@@ -430,21 +380,28 @@ bac_eac["BAC"] = pd.to_numeric(bac_eac["BAC"], errors="coerce")
 bac_eac["EAC"] = pd.to_numeric(bac_eac["EAC"], errors="coerce")
 bac_eac["VAC"] = bac_eac["BAC"] - bac_eac["EAC"]
 
-subteam_bac_eac_vac = bac_eac.rename(columns={"PROGRAM":"ProgramID","SUB_TEAM":"SubTeam"}).copy()
-subteam_bac_eac_vac["Cause & Corrective Actions"] = ""
-subteam_bac_eac_vac = subteam_bac_eac_vac[
-    ["SubTeam","BAC","EAC","VAC","Cause & Corrective Actions","ProgramID"]
-].sort_values(["ProgramID","SubTeam"]).reset_index(drop=True)
+# VAC/BAC ratio and color (this is what PPT thresholds are defined on)
+bac_eac["VAC_BAC"] = safe_div(bac_eac["VAC"], bac_eac["BAC"])
+bac_eac["VAC_Color"] = pd.Series(bac_eac["VAC_BAC"]).map(color_vac_over_bac)
+
+product_team_bac_eac_vac = bac_eac.rename(columns={"PROGRAM":"ProgramID","SUB_TEAM":"Product Team"}).copy()
+product_team_bac_eac_vac["Cause & Corrective Actions"] = ""
+product_team_bac_eac_vac = product_team_bac_eac_vac[
+    ["Product Team","BAC","EAC","VAC","VAC_BAC","VAC_Color","Cause & Corrective Actions","ProgramID"]
+].sort_values(["ProgramID","Product Team"]).reset_index(drop=True)
 
 # -------------------------
-# PROGRAM MANPOWER (Hours) (kept; BCWS scale consistent)
-# EXACT headers:
-# ProgramID | Demand Hours | Actual Hours | % Var | Next Mo BCWS Hours | Next Mo ETC Hours | Cause & Corrective Actions
+# PROGRAM MANPOWER (Hours)  (% Var coloring added)
+# EXACT headers (+ new):
+# ProgramID | Demand Hours | Actual Hours | % Var | % Var Color | Next Mo BCWS Hours | Next Mo ETC Hours | Cause & Corrective Actions
+# % Var = (Actual / Demand)*100
+# % Var Color uses PPT Program Manpower thresholds
 # -------------------------
 man = ctd_prog_p.rename(columns={"PROGRAM":"ProgramID","BCWS":"Demand Hours","ACWP":"Actual Hours"}).copy()
 man["Demand Hours"] = pd.to_numeric(man["Demand Hours"], errors="coerce")
 man["Actual Hours"] = pd.to_numeric(man["Actual Hours"], errors="coerce")
 man["% Var"] = safe_div(man["Actual Hours"], man["Demand Hours"]) * 100.0
+man["% Var Color"] = man["% Var"].map(color_program_manpower)
 
 next_window = base[(base["DATE"] > AS_OF_DATE) & (base["DATE"] <= NEXT_PERIOD_END) & (base["COST_SET"].isin(["BCWS","ETC"]))].copy()
 next_prog = (
@@ -460,23 +417,23 @@ next_prog = next_prog.rename(columns={"PROGRAM":"ProgramID","BCWS":"Next Mo BCWS
 program_manpower = man.merge(next_prog[["ProgramID","Next Mo BCWS Hours","Next Mo ETC Hours"]], on="ProgramID", how="left")
 program_manpower["Cause & Corrective Actions"] = ""
 program_manpower = program_manpower[
-    ["ProgramID","Demand Hours","Actual Hours","% Var","Next Mo BCWS Hours","Next Mo ETC Hours","Cause & Corrective Actions"]
+    ["ProgramID","Demand Hours","Actual Hours","% Var","% Var Color","Next Mo BCWS Hours","Next Mo ETC Hours","Cause & Corrective Actions"]
 ].sort_values(["ProgramID"]).reset_index(drop=True)
 
 # -------------------------
-# PRESERVE EXISTING COMMENTS (if file exists)
+# PRESERVE EXISTING COMMENTS (key cols updated for "Product Team")
 # -------------------------
 program_overview = preserve_comments(
     OUTPUT_XLSX, "Program_Overview", program_overview,
-    key_cols=["ProgramID","Metric"], comment_col=comment_col_prog
+    key_cols=["ProgramID","Metric"], comment_col="Comments / Root Cause & Corrective Actions"
 )
-subteam_spi_cpi = preserve_comments(
-    OUTPUT_XLSX, "SubTeam_SPI_CPI", subteam_spi_cpi,
-    key_cols=["ProgramID","SubTeam"], comment_col="Cause & Corrective Actions"
+product_team_spi_cpi = preserve_comments(
+    OUTPUT_XLSX, "SubTeam_SPI_CPI", product_team_spi_cpi,   # keep sheet name stable unless you want it renamed
+    key_cols=["ProgramID","Product Team"], comment_col="Cause & Corrective Actions"
 )
-subteam_bac_eac_vac = preserve_comments(
-    OUTPUT_XLSX, "SubTeam_BAC_EAC_VAC", subteam_bac_eac_vac,
-    key_cols=["ProgramID","SubTeam"], comment_col="Cause & Corrective Actions"
+product_team_bac_eac_vac = preserve_comments(
+    OUTPUT_XLSX, "SubTeam_BAC_EAC_VAC", product_team_bac_eac_vac,  # keep sheet name stable unless you want it renamed
+    key_cols=["ProgramID","Product Team"], comment_col="Cause & Corrective Actions"
 )
 program_manpower = preserve_comments(
     OUTPUT_XLSX, "Program_Manpower", program_manpower,
@@ -484,12 +441,12 @@ program_manpower = preserve_comments(
 )
 
 # -------------------------
-# WRITE ONE EXCEL (PowerBI)
+# WRITE ONE EXCEL (PowerBI)  (re-saves)
 # -------------------------
 with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
     program_overview.to_excel(writer, sheet_name="Program_Overview", index=False)
-    subteam_spi_cpi.to_excel(writer, sheet_name="SubTeam_SPI_CPI", index=False)
-    subteam_bac_eac_vac.to_excel(writer, sheet_name="SubTeam_BAC_EAC_VAC", index=False)
+    product_team_spi_cpi.to_excel(writer, sheet_name="SubTeam_SPI_CPI", index=False)
+    product_team_bac_eac_vac.to_excel(writer, sheet_name="SubTeam_BAC_EAC_VAC", index=False)
     program_manpower.to_excel(writer, sheet_name="Program_Manpower", index=False)
 
 print(f"\nSaved: {OUTPUT_XLSX.resolve()}")
@@ -497,14 +454,10 @@ print(f"\nSaved: {OUTPUT_XLSX.resolve()}")
 # -------------------------
 # QUICK DIAGNOSTICS
 # -------------------------
-def miss_rate(df, cols):
-    out = {}
-    for c in cols:
-        out[c] = float(pd.to_numeric(df[c], errors="coerce").isna().mean()) if c in df.columns else None
-    return out
-
-print("\nQuick missingness check:")
-print("Program_Overview:", miss_rate(program_overview, ["CTD","LSD","CTD_Color","LSD_Color"]))
-print("SubTeam_SPI_CPI:", miss_rate(subteam_spi_cpi, ["SPI LSD","SPI CTD","CPI LSD","CPI CTD"]))
-print("SubTeam_BAC_EAC_VAC:", miss_rate(subteam_bac_eac_vac, ["BAC","EAC","VAC"]))
-print("Program_Manpower:", miss_rate(program_manpower, ["Demand Hours","Actual Hours","% Var"]))
+print("\nSanity checks:")
+print("Program_Overview columns:", list(program_overview.columns))
+print("SPI/CPI colors null rate:",
+      float(program_overview["CTD_Color"].isna().mean()),
+      float(program_overview["LSD_Color"].isna().mean()))
+print("Product Team BAC/EAC/VAC colors null rate:", float(product_team_bac_eac_vac["VAC_Color"].isna().mean()))
+print("Program_Manpower %Var colors null rate:", float(program_manpower["% Var Color"].isna().mean()))
