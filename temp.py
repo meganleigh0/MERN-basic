@@ -1,13 +1,24 @@
 # ============================================================
 # EVMS -> PowerBI Excel Export (ONE CELL)
 # MUST START FROM: cobra_merged_df (your cleaned LONG dataset)
-# No BCWS scaling / no assumptions. SPI/CPI computed directly.
 #
-# Output sheets (NAMES LOCKED):
-#   Program_Overview
-#   ProductTeam_SPI_CPI
-#   ProductTeam_BAC_EAC_VAC
-#   Program_Manpower
+# CHANGE REQUEST (DONE):
+#   ✅ Program_Overview is now WIDE per program:
+#        ProgramID | SPI_CTD | SPI_LSD | CPI_CTD | CPI_LSD | SPI_CTD_Color | ... | Comments...
+#      (NO "Metric" column)
+#   ✅ Sheet names LOCKED (unchanged):
+#        Program_Overview
+#        ProductTeam_SPI_CPI
+#        ProductTeam_BAC_EAC_VAC
+#        Program_Manpower
+#   ✅ Product Team naming kept as "Product Team"
+#   ✅ Color-spec columns for SPI/CPI/VAC/%Var included
+#   ✅ Preserves existing comments when the file already exists
+#
+# NOTE:
+#   - This assumes cobra_merged_df is LONG with semantic columns:
+#       Program, Product Team, Date, Cost_Set, Hours
+#   - NO scaling, NO BCWS manipulation.
 # ============================================================
 
 import re
@@ -19,7 +30,7 @@ import pandas as pd
 # -------------------------
 # SETTINGS (edit if needed)
 # -------------------------
-PROGRAMS_KEEP = ["ABRAMS 22", "OLYMPUS", "STRYKER BULG", "XM30"]  # must match your slicer labels
+PROGRAMS_KEEP = ["ABRAMS 22", "OLYMPUS", "STRYKER BULG", "XM30"]  # must match slicer labels
 TODAY_OVERRIDE = None  # e.g. "2026-02-10" (leave None for today)
 ASOF_OVERRIDE = None   # e.g. "2026-01-29" (leave None to auto compute last Thu prev month)
 OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")
@@ -98,7 +109,7 @@ def add_month(d, months=1):
     return date(y, m, min(d.day, last_day))
 
 # -------------------------
-# COLUMN NORMALIZATION (NO assumptions on names, but STRICT on meaning)
+# COLUMN NORMALIZATION (STRICT on meaning; no cost-set remap)
 # -------------------------
 def clean_colname(c):
     return re.sub(r"[^A-Z0-9_]+", "_", str(c).strip().upper().replace(" ", "_").replace("-", "_"))
@@ -112,8 +123,7 @@ def normalize_program(x):
 def normalize_product_team(x):
     if pd.isna(x): return None
     s = str(x).strip().upper()
-    # keep A-Z0-9 only (KUW stays KUW even if "K U W")
-    s = re.sub(r"[^A-Z0-9]+", "", s)
+    s = re.sub(r"[^A-Z0-9]+", "", s)  # KUW stays KUW even if "K U W"
     return s if s else None
 
 def normalize_cost_set(x):
@@ -121,15 +131,13 @@ def normalize_cost_set(x):
     s = str(x).strip().upper()
     s = re.sub(r"\s+", "", s)
     s = s.replace("-", "").replace("_", "")
-    # YOU said you already fixed cost-sets, so we do NOT remap here.
-    # We just normalize to consistent tokens: BCWS/BCWP/ACWP/ETC/BAC/EAC/VAC etc.
     return s
 
 def coerce_to_long(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df_in.copy()
     df.columns = [clean_colname(c) for c in df.columns]
 
-    # detect if this is already an OUTPUT/WIDE table (your error screenshot)
+    # detect if someone accidentally passed an already-output WIDE table
     wide_markers = {"BCWS_CTD","BCWP_CTD","ACWP_CTD","SPI_CTD","CPI_CTD"}
     if len(wide_markers.intersection(set(df.columns))) >= 2 and "DATE" not in df.columns and "COST_SET" not in df.columns:
         raise ValueError(
@@ -138,7 +146,6 @@ def coerce_to_long(df_in: pd.DataFrame) -> pd.DataFrame:
             f"Columns found: {list(df.columns)}"
         )
 
-    # map required columns from synonyms
     colmap = {}
 
     # PROGRAM
@@ -213,7 +220,7 @@ def pivot_costsets(df, idx_cols, val_col, needed):
     return pv
 
 # ============================================================
-# START: cobra_merged_df ONLY (as requested)
+# START: cobra_merged_df ONLY
 # ============================================================
 if "cobra_merged_df" not in globals() or not isinstance(cobra_merged_df, pd.DataFrame) or len(cobra_merged_df) == 0:
     raise ValueError("cobra_merged_df is not defined or is empty. Put your cleaned long Cobra data into cobra_merged_df first.")
@@ -297,37 +304,42 @@ ctd_prog_w = pivot_costsets(ctd_prog, ["PROGRAM"],              "CTD_HRS", NEEDE
 lsd_prog_w = pivot_costsets(lsd_prog, ["PROGRAM"],              "LSD_HRS", NEEDED)
 
 # ============================================================
-# PROGRAM OVERVIEW (LONG)
-# ProgramID | Metric | CTD | LSD | CTD_Color | LSD_Color | Comments...
+# PROGRAM OVERVIEW (WIDE — NO Metric column)
+# EXACT LAYOUT FOR POWER BI:
+#   ProgramID
+#   SPI_CTD, SPI_LSD, CPI_CTD, CPI_LSD
+#   SPI_CTD_Color, SPI_LSD_Color, CPI_CTD_Color, CPI_LSD_Color
+#   Comments / Root Cause & Corrective Actions
 # ============================================================
 prog = ctd_prog_w.merge(lsd_prog_w, on=["PROGRAM"], how="outer", suffixes=("_CTD","_LSD")).copy()
 prog.rename(columns={"PROGRAM":"ProgramID"}, inplace=True)
 
+# compute SPI/CPI directly (NO scaling)
 prog["SPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"])
 prog["SPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"])
 prog["CPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"])
 prog["CPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"])
 
-rows = []
-for metric in ["SPI","CPI"]:
-    if metric == "SPI":
-        ctd = prog["SPI_CTD"]; lsd = prog["SPI_LSD"]
-    else:
-        ctd = prog["CPI_CTD"]; lsd = prog["CPI_LSD"]
-    rows.append(pd.DataFrame({
-        "ProgramID": prog["ProgramID"],
-        "Metric": metric,
-        "CTD": ctd,
-        "LSD": lsd,
-        "CTD_Color": ctd.map(color_spi_cpi),
-        "LSD_Color": lsd.map(color_spi_cpi),
-    }))
+# color columns (field-value driven in Power BI)
+prog["SPI_CTD_Color"] = pd.Series(prog["SPI_CTD"]).map(color_spi_cpi)
+prog["SPI_LSD_Color"] = pd.Series(prog["SPI_LSD"]).map(color_spi_cpi)
+prog["CPI_CTD_Color"] = pd.Series(prog["CPI_CTD"]).map(color_spi_cpi)
+prog["CPI_LSD_Color"] = pd.Series(prog["CPI_LSD"]).map(color_spi_cpi)
 
-Program_Overview = pd.concat(rows, ignore_index=True)
 comment_overview = "Comments / Root Cause & Corrective Actions"
-Program_Overview[comment_overview] = ""
-Program_Overview = Program_Overview.sort_values(["ProgramID","Metric"]).reset_index(drop=True)
-Program_Overview = preserve_comments(OUTPUT_XLSX, "Program_Overview", Program_Overview, ["ProgramID","Metric"], comment_overview)
+prog[comment_overview] = ""
+
+Program_Overview = prog[
+    ["ProgramID",
+     "SPI_CTD","SPI_LSD","CPI_CTD","CPI_LSD",
+     "SPI_CTD_Color","SPI_LSD_Color","CPI_CTD_Color","CPI_LSD_Color",
+     comment_overview]
+].sort_values(["ProgramID"]).reset_index(drop=True)
+
+Program_Overview = preserve_comments(
+    OUTPUT_XLSX, "Program_Overview", Program_Overview,
+    ["ProgramID"], comment_overview
+)
 
 # ============================================================
 # PRODUCT TEAM SPI/CPI
@@ -349,7 +361,10 @@ ProductTeam_SPI_CPI["CPI_CTD_Color"] = ProductTeam_SPI_CPI["CPI_CTD"].map(color_
 comment_pt = "Cause & Corrective Actions"
 ProductTeam_SPI_CPI[comment_pt] = ""
 ProductTeam_SPI_CPI = ProductTeam_SPI_CPI.sort_values(["ProgramID","Product Team"]).reset_index(drop=True)
-ProductTeam_SPI_CPI = preserve_comments(OUTPUT_XLSX, "ProductTeam_SPI_CPI", ProductTeam_SPI_CPI, ["ProgramID","Product Team"], comment_pt)
+ProductTeam_SPI_CPI = preserve_comments(
+    OUTPUT_XLSX, "ProductTeam_SPI_CPI", ProductTeam_SPI_CPI,
+    ["ProgramID","Product Team"], comment_pt
+)
 
 # ============================================================
 # PRODUCT TEAM BAC/EAC/VAC
@@ -364,6 +379,7 @@ bcws_year = (
     .rename(columns={"HOURS":"BAC"})
 )
 
+# NOTE: use CTD totals from ctd_pt_w (already as-of summed)
 acwp_ctd = ctd_pt_w[["PROGRAM","PRODUCT_TEAM","ACWP"]].rename(columns={"ACWP":"ACWP_CTD"})
 etc_ctd  = ctd_pt_w[["PROGRAM","PRODUCT_TEAM","ETC"]].rename(columns={"ETC":"ETC_CTD"})
 
@@ -395,7 +411,7 @@ ProductTeam_BAC_EAC_VAC = preserve_comments(
 # Demand Hours = BCWS_CTD
 # Actual Hours = ACWP_CTD
 # % Var = Actual / Demand * 100
-# Add color column for % Var
+# Color column for % Var
 # Next Mo BCWS/ETC from (AS_OF_DATE, NEXT_PERIOD_END]
 # ============================================================
 man = ctd_prog_w.rename(columns={"PROGRAM":"ProgramID", "BCWS":"Demand Hours", "ACWP":"Actual Hours"}).copy()
@@ -433,20 +449,20 @@ Program_Manpower = Program_Manpower[
     ["ProgramID","Demand Hours","Actual Hours","% Var","% Var Color","Next Mo BCWS Hours","Next Mo ETC Hours",comment_pt]
 ].sort_values(["ProgramID"]).reset_index(drop=True)
 
-Program_Manpower = preserve_comments(OUTPUT_XLSX, "Program_Manpower", Program_Manpower, ["ProgramID"], comment_pt)
+Program_Manpower = preserve_comments(
+    OUTPUT_XLSX, "Program_Manpower", Program_Manpower,
+    ["ProgramID"], comment_pt
+)
 
 # ============================================================
-# HARD VERIFICATION OUTPUTS (SPI sanity)
+# QUICK DIAGNOSTICS (optional prints)
 # ============================================================
-print("\n--- SPI/CPI sanity checks (NO scaling applied) ---")
-print("Program-level SPI_CTD median by program:")
-print(ProductTeam_SPI_CPI.groupby("ProgramID")["SPI_CTD"].median(numeric_only=True))
-print("\nProgram-level SPI_LSD median by program:")
-print(ProductTeam_SPI_CPI.groupby("ProgramID")["SPI_LSD"].median(numeric_only=True))
+print("\n--- Program_Overview preview ---")
+display(Program_Overview.head(10))
 
-print("\nKUW check (ABRAMS 22):")
+print("\n--- KUW check (ABRAMS 22) in ProductTeam_SPI_CPI ---")
 kuw = ProductTeam_SPI_CPI[(ProductTeam_SPI_CPI["ProgramID"]=="ABRAMS 22") & (ProductTeam_SPI_CPI["Product Team"]=="KUW")]
-print(kuw if len(kuw) else "KUW not present in ProductTeam_SPI_CPI output (check base data for KUW rows in BCWS/BCWP/ACWP/ETC).")
+print(kuw if len(kuw) else "KUW not present (check cobra_merged_df rows for ABRAMS 22 + KUW + BCWS/BCWP/ACWP/ETC <= AS_OF_DATE).")
 
 # ============================================================
 # WRITE EXCEL (sheet order matters)
@@ -460,18 +476,30 @@ with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
 print(f"\nSaved: {OUTPUT_XLSX.resolve()}")
 
 # ============================================================
-# POWER BI: make Program_Overview look like your 2-row SPI/CPI card
+# POWER BI: Format Program_Overview like your 2-row SPI/CPI card
+# (Now wide columns, no Metric column)
 # ============================================================
-print("""
-Power BI formatting for the overview card:
-1) Use table visual (or matrix).
-2) Add fields in this order:
-   - Metric
-   - CTD
-   - LSD
-   - Comments / Root Cause & Corrective Actions
-3) Add slicer for ProgramID (select one program).
-4) Conditional formatting:
-   - For CTD column: Background color -> Format by Field value -> Based on CTD_Color
-   - For LSD column: Background color -> Format by Field value -> Based on LSD_Color
+print(r"""
+Power BI (Program Overview Card) - easiest path:
+
+A) If you want EXACTLY two rows (SPI row + CPI row like your PPT):
+   1) Load Program_Overview (this sheet is wide per ProgramID).
+   2) In Power Query (recommended), duplicate query:
+        - Create a small "Program_Overview_Card" table by unpivoting ONLY SPI/CPI columns:
+          Keep: ProgramID, Comments...
+          Unpivot: SPI_CTD, SPI_LSD, CPI_CTD, CPI_LSD
+          Then split into rows for SPI vs CPI and columns CTD/LSD.
+      (If you want, I can give you the exact Power Query steps.)
+
+B) If you're OK with a single-row table (one program per row):
+   1) Use a Table visual.
+   2) Add columns:
+        ProgramID, SPI_CTD, SPI_LSD, CPI_CTD, CPI_LSD, Comments...
+   3) Conditional formatting -> Background color -> Format by Field value:
+        SPI_CTD uses SPI_CTD_Color
+        SPI_LSD uses SPI_LSD_Color
+        CPI_CTD uses CPI_CTD_Color
+        CPI_LSD uses CPI_LSD_Color
+
+Either way, this pipeline outputs exactly what Power BI needs: value + color field for each cell.
 """)
