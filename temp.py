@@ -1,431 +1,361 @@
-# ============================================================
-# EVMS -> PowerBI Excel Export (ONE CELL) — FIXED, CONSISTENT 4-WEEK LSD
-# INPUT MUST START FROM: cobra_merged_df (LONG format)
-# Output sheets (NAMES LOCKED):
-#   Program_Overview
-#   ProductTeam_SPI_CPI
-#   ProductTeam_BAC_EAC_VAC
-#   Program_Manpower
-# ============================================================
+# ============================================
+# EVMS PowerBI Input Builder (Single Pipeline)
+# Fixes LSD SPI/CPI by using per-group "Last Common Date" (LCD)
+# Standard rolling LSD window (default 4 weeks)
+# Outputs 4 Excel sheets for Power BI
+# ============================================
 
-import re
-from pathlib import Path
-from datetime import date, datetime, timedelta
-import numpy as np
+from __future__ import annotations
 import pandas as pd
+import numpy as np
+from pathlib import Path
 
-# -------------------------
-# SETTINGS
-# -------------------------
-TODAY_OVERRIDE = None     # e.g. "2026-02-12"
-LSD_WEEKS = 4             # FIXED WINDOW (4 weeks)
-OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")
+# ----------------------------
+# CONFIG
+# ----------------------------
+TODAY = pd.Timestamp.today().normalize()
 
-# -------------------------
-# COLORS (hex)
-# -------------------------
-CLR_LIGHT_BLUE = "#8EB4E3"
-CLR_GREEN      = "#339966"
-CLR_YELLOW     = "#FFFF99"
-CLR_RED        = "#C0504D"
+LSD_WEEKS = 4
+LSD_DAYS = LSD_WEEKS * 7
 
-def _to_num(x):
-    return pd.to_numeric(x, errors="coerce")
+# Input options:
+#  - If you already have cobra_merged_df in memory, set INPUT_MODE="dataframe" and assign it.
+#  - Otherwise set INPUT_MODE="file" and point to a CSV/TSV/Excel extract that contains the EVMS long table.
 
-def safe_div(a, b):
-    a = _to_num(a)
-    b = _to_num(b)
-    out = np.where((b == 0) | pd.isna(b), np.nan, a / b)
+INPUT_MODE = "file"   # "file" or "dataframe"
+
+# If file:
+INPUT_PATH = Path(r"C:\Users\YOURUSER\Desktop\evms_powerbi\cobra_evms_long.tsv")  # change
+INPUT_FILETYPE = "tsv"  # "tsv", "csv", or "xlsx"
+
+# If excel:
+INPUT_SHEET = "EVMS_LONG"  # only used when INPUT_FILETYPE == "xlsx"
+
+# Output
+OUTPUT_XLSX = Path(r"C:\Users\YOURUSER\Desktop\evms_powerbi\EVMS_PowerBI_Input.xlsx")
+
+# Columns expected in the LONG input:
+# PROGRAM, PRODUCT_TEAM, COST_SET, DATE, VAL
+COL_PROGRAM = "PROGRAM"
+COL_TEAM    = "PRODUCT_TEAM"
+COL_COSTSET = "COST_SET"
+COL_DATE    = "DATE"
+COL_VAL     = "VAL"
+
+# -----------------------------------
+# OPTIONAL: if your source uses different labels
+# and you already did mapping earlier, keep this empty.
+# -----------------------------------
+COSTSET_NORMALIZE_MAP = {
+    # examples (only needed if your file isn't already mapped):
+    # "BCWS HRS": "BCWS",
+    # "BCWP HRS": "BCWP",
+    # "ACWP HRS": "ACWP",
+    # "ETC HRS":  "ETC",
+}
+
+KEEP_COSTSETS = {"BCWS","BCWP","ACWP","ETC"}  # what we care about
+
+# ----------------------------
+# HELPERS
+# ----------------------------
+def _norm_str(x: str) -> str:
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+def _safe_div(n, d):
+    n = pd.to_numeric(n, errors="coerce")
+    d = pd.to_numeric(d, errors="coerce")
+    out = np.where((d == 0) | pd.isna(d) | pd.isna(n), np.nan, n / d)
     return out
 
-# SPI/CPI thresholds (your PPT bands)
-def color_spi_cpi(x):
-    x = _to_num(x)
-    if pd.isna(x): return None
-    if x >= 1.055: return CLR_LIGHT_BLUE
-    if x >= 0.975: return CLR_GREEN
-    if x >= 0.945: return CLR_YELLOW
-    return CLR_RED
+def color_rule_spi_cpi(x: float) -> str | None:
+    # same thresholds you used previously
+    if pd.isna(x):
+        return None
+    if x >= 1.05:
+        return "#8EB4E3"  # blue
+    if x >= 0.98:
+        return "#339966"  # green
+    if x >= 0.95:
+        return "#FFFF99"  # yellow
+    return "#C0504D"      # red
 
-# VAC/BAC thresholds (PPT)
-def color_vac_over_bac(x):
-    x = _to_num(x)
-    if pd.isna(x): return None
-    if x >= 0.055:  return CLR_LIGHT_BLUE
-    if x >= -0.025: return CLR_GREEN
-    if x >= -0.055: return CLR_YELLOW
-    return CLR_RED
+def color_rule_vac_pct(x: float) -> str | None:
+    # You can tune these if you want; leaving sensible defaults:
+    # >=0 green, between 0 and -0.05 yellow, < -0.05 red
+    if pd.isna(x):
+        return None
+    if x >= 0:
+        return "#339966"
+    if x >= -0.05:
+        return "#FFFF99"
+    return "#C0504D"
 
-# Manpower %Var thresholds (PPT)
-def color_manpower_pct(pct):
-    pct = _to_num(pct)
-    if pd.isna(pct): return None
-    if pct >= 109.5: return CLR_RED
-    if pct >= 105.5: return CLR_YELLOW
-    if pct >= 89.5:  return CLR_GREEN
-    if pct >= 85.5:  return CLR_YELLOW
-    return CLR_RED
+def _coerce_date(s):
+    return pd.to_datetime(s, errors="coerce").dt.date
 
-# -------------------------
-# LIGHT NORMALIZATION ONLY (do NOT remap cost sets)
-# -------------------------
-def clean_colname(c):
-    return re.sub(r"[^A-Z0-9_]+", "_", str(c).strip().upper().replace(" ", "_").replace("-", "_"))
+# ----------------------------
+# STEP 1) LOAD LONG EVMS TABLE
+# ----------------------------
+if INPUT_MODE == "dataframe":
+    # Expect you already defined cobra_merged_df upstream
+    base = cobra_merged_df.copy()
+else:
+    if INPUT_FILETYPE == "tsv":
+        base = pd.read_csv(INPUT_PATH, sep="\t")
+    elif INPUT_FILETYPE == "csv":
+        base = pd.read_csv(INPUT_PATH)
+    elif INPUT_FILETYPE == "xlsx":
+        base = pd.read_excel(INPUT_PATH, sheet_name=INPUT_SHEET)
+    else:
+        raise ValueError("INPUT_FILETYPE must be one of: tsv, csv, xlsx")
 
-def normalize_program(x):
-    if pd.isna(x): return None
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def normalize_product_team(x):
-    if pd.isna(x): return None
-    s = str(x).strip().upper()
-    s = re.sub(r"\s+", "", s)          # KUW / K U W -> KUW
-    s = re.sub(r"[^A-Z0-9]+", "", s)
-    return s if s else None
-
-def normalize_cost_set(x):
-    if pd.isna(x): return None
-    s = str(x).strip().upper()
-    s = re.sub(r"\s+", "", s)
-    s = s.replace("-", "").replace("_", "")
-    # expected already mapped to BCWS/BCWP/ACWP/ETC (or close variants)
-    # normalize common variants safely without "re-mapping" business logic:
-    if s in ["BCWS", "BCWP", "ACWP", "ETC"]:
-        return s
-    # allow "COSTSET" already clean but with extra text (rare):
-    return s
-
-def coerce_to_long(df_in: pd.DataFrame) -> pd.DataFrame:
-    df = df_in.copy()
-    df.columns = [clean_colname(c) for c in df.columns]
-
-    # detect and block if already wide output
-    wide_markers = {"SPI_CTD","CPI_CTD","SPI_LSD","CPI_LSD"}
-    if len(wide_markers.intersection(set(df.columns))) >= 2 and "COST_SET" not in df.columns:
-        raise ValueError(
-            "cobra_merged_df looks like a WIDE output table, not the LONG cobra dataset.\n"
-            "Need LONG rows with Program/ProductTeam/Date/Cost_Set/Value."
-        )
-
-    # column synonyms
-    colmap = {}
-
-    for c in ["PROGRAM","PROG","PROJECT","PROGRAM_NAME","IPT_PROGRAM"]:
-        if c in df.columns: colmap[c] = "PROGRAM"; break
-
-    for c in ["PRODUCT_TEAM","PRODUCTTEAM","SUB_TEAM","SUBTEAM","IPT","IPT_NAME","CONTROL_ACCOUNT","CA"]:
-        if c in df.columns: colmap[c] = "PRODUCT_TEAM"; break
-
-    for c in ["DATE","PERIOD_END","PERIODEND","STATUS_DATE","AS_OF_DATE"]:
-        if c in df.columns: colmap[c] = "DATE"; break
-
-    for c in ["COST_SET","COSTSET","COST_SET_NAME","COSTSETNAME","COST_CATEGORY","COST_SET_TYPE"]:
-        if c in df.columns: colmap[c] = "COST_SET"; break
-
-    # value column can be HOURS or VAL etc.
-    for c in ["HOURS","HRS","VAL","VALUE","AMOUNT","TOTAL_HOURS"]:
-        if c in df.columns: colmap[c] = "VAL"; break
-
-    df = df.rename(columns=colmap)
-
-    required = ["PROGRAM","PRODUCT_TEAM","DATE","COST_SET","VAL"]
-    missing = [c for c in required if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing required columns {missing}. Found: {list(df.columns)}")
-
-    df["PROGRAM"] = df["PROGRAM"].map(normalize_program)
-    df["PRODUCT_TEAM"] = df["PRODUCT_TEAM"].map(normalize_product_team)
-    df["COST_SET"] = df["COST_SET"].map(normalize_cost_set)
-
-    df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce").dt.date
-    df["VAL"]  = pd.to_numeric(df["VAL"], errors="coerce")
-
-    df = df.dropna(subset=["PROGRAM","PRODUCT_TEAM","DATE","COST_SET","VAL"])
-    return df
-
-# -------------------------
-# COMMENT PRESERVATION
-# -------------------------
-def preserve_comments(existing_path: Path, sheet: str, df_new: pd.DataFrame, key_cols, comment_col):
-    if (not existing_path.exists()) or (comment_col not in df_new.columns):
-        return df_new
-    try:
-        old = pd.read_excel(existing_path, sheet_name=sheet)
-    except Exception:
-        return df_new
-    if old is None or len(old) == 0:
-        return df_new
-    if (comment_col not in old.columns) or (not all(k in old.columns for k in key_cols)):
-        return df_new
-
-    old = old[key_cols + [comment_col]].copy().dropna(subset=key_cols)
-    old = old.rename(columns={comment_col: f"{comment_col}_old"})
-    out = df_new.merge(old, on=key_cols, how="left")
-    oldcol = f"{comment_col}_old"
-    if oldcol in out.columns:
-        mask = out[oldcol].notna() & (out[oldcol].astype(str).str.strip() != "")
-        out.loc[mask, comment_col] = out.loc[mask, oldcol]
-        out = out.drop(columns=[oldcol])
-    return out
-
-# -------------------------
-# START
-# -------------------------
-if "cobra_merged_df" not in globals() or not isinstance(cobra_merged_df, pd.DataFrame) or len(cobra_merged_df) == 0:
-    raise ValueError("cobra_merged_df is not defined or is empty.")
-
-base = coerce_to_long(cobra_merged_df)
-
-# keep only EVMS cost sets we need (no remapping, just select)
-EVMS_SETS = ["BCWS","BCWP","ACWP","ETC"]
-base = base[base["COST_SET"].isin(EVMS_SETS)].copy()
-
-today = pd.to_datetime(TODAY_OVERRIDE).date() if TODAY_OVERRIDE else date.today()
-
-# LSD_END = latest date in data <= today
-base_le_today = base[base["DATE"] <= today]
-if base_le_today.empty:
-    raise ValueError("No rows in cobra_merged_df have DATE <= today (or TODAY_OVERRIDE). Check your dates.")
-LSD_END = base_le_today["DATE"].max()
-
-# Fixed 4-week window (inclusive)
-LSD_START = LSD_END - timedelta(days=(LSD_WEEKS * 7 - 1))
-PREV_DATE = LSD_START  # consistent, not “special calendar”
-AS_OF_DATE = LSD_END   # CTD cutoff = LSD_END
-
-# Next month window (28 days after LSD_END)
-NEXT_END = LSD_END + timedelta(days=28)
-
-print("TODAY:", today)
-print("LSD_START:", LSD_START)
-print("LSD_END:", LSD_END)
-print("AS_OF_DATE:", AS_OF_DATE)
-print("NEXT_END:", NEXT_END)
-print("Rows in EVMS (BCWS/BCWP/ACWP/ETC):", len(base))
-
-# skeletons to eliminate missing rows
-programs = sorted(base["PROGRAM"].dropna().unique().tolist())
-pt_keys  = base[["PROGRAM","PRODUCT_TEAM"]].drop_duplicates()
-
-# -------------------------
-# Aggregations
-# -------------------------
-def agg_costsets(df, group_cols):
-    g = (df.groupby(group_cols + ["COST_SET"], as_index=False)["VAL"].sum())
-    pv = g.pivot_table(index=group_cols, columns="COST_SET", values="VAL", aggfunc="sum").reset_index()
-    for cs in EVMS_SETS:
-        if cs not in pv.columns:
-            pv[cs] = 0.0
-    pv[EVMS_SETS] = pv[EVMS_SETS].fillna(0.0)
-    return pv
-
-# CTD: everything <= LSD_END
-ctd_df = base[base["DATE"] <= LSD_END]
-ctd_prog = agg_costsets(ctd_df, ["PROGRAM"])
-ctd_pt   = agg_costsets(ctd_df, ["PROGRAM","PRODUCT_TEAM"])
-
-# LSD window: LSD_START..LSD_END inclusive
-lsd_df = base[(base["DATE"] >= LSD_START) & (base["DATE"] <= LSD_END)]
-lsd_prog = agg_costsets(lsd_df, ["PROGRAM"])
-lsd_pt   = agg_costsets(lsd_df, ["PROGRAM","PRODUCT_TEAM"])
-
-# Next 4 weeks after LSD_END for manpower projection
-next_df = base[(base["DATE"] > LSD_END) & (base["DATE"] <= NEXT_END) & (base["COST_SET"].isin(["BCWS","ETC"]))]
-next_prog = agg_costsets(next_df, ["PROGRAM"])[["PROGRAM","BCWS","ETC"]].rename(
-    columns={"BCWS":"Next Mo BCWS Hours", "ETC":"Next Mo ETC Hours"}
-)
-
-# -------------------------
-# PROGRAM OVERVIEW (WIDE like your screenshot)
-# -------------------------
-prog_skel = pd.DataFrame({"PROGRAM": programs})
-prog = (prog_skel
-        .merge(lsd_prog, on="PROGRAM", how="left", suffixes=("","_LSD"))
-        .merge(ctd_prog, on="PROGRAM", how="left", suffixes=("_LSD","_CTD"))
-       )
-
-# after merges, ensure expected columns exist
-for cs in EVMS_SETS:
-    if f"{cs}_LSD" not in prog.columns: prog[f"{cs}_LSD"] = 0.0
-    if f"{cs}_CTD" not in prog.columns: prog[f"{cs}_CTD"] = 0.0
-
-prog[[f"{cs}_LSD" for cs in EVMS_SETS] + [f"{cs}_CTD" for cs in EVMS_SETS]] = \
-    prog[[f"{cs}_LSD" for cs in EVMS_SETS] + [f"{cs}_CTD" for cs in EVMS_SETS]].fillna(0.0)
-
-prog["SPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"])
-prog["CPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"])
-prog["SPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"])
-prog["CPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"])
-
-# user asked: no NaN -> replace NaN ratios with 0
-for c in ["SPI_LSD","CPI_LSD","SPI_CTD","CPI_CTD"]:
-    prog[c] = pd.to_numeric(prog[c], errors="coerce").fillna(0.0)
-
-Program_Overview = pd.DataFrame({
-    "ProgramID": prog["PROGRAM"],
-    "SPI_LSD": prog["SPI_LSD"],
-    "SPI_CTD": prog["SPI_CTD"],
-    "CPI_LSD": prog["CPI_LSD"],
-    "CPI_CTD": prog["CPI_CTD"],
+# Standardize columns
+base = base.rename(columns={
+    COL_PROGRAM: "PROGRAM",
+    COL_TEAM: "PRODUCT_TEAM",
+    COL_COSTSET: "COST_SET",
+    COL_DATE: "DATE",
+    COL_VAL: "VAL"
 })
 
-Program_Overview["LSD_START"] = LSD_START
-Program_Overview["LSD_END"]   = LSD_END
-Program_Overview["AS_OF_DATE"] = AS_OF_DATE
-Program_Overview["PREV_DATE"] = PREV_DATE
+for c in ["PROGRAM","PRODUCT_TEAM","COST_SET"]:
+    base[c] = base[c].map(_norm_str)
 
-Program_Overview["SPI_LSD_Color"] = Program_Overview["SPI_LSD"].map(color_spi_cpi)
-Program_Overview["SPI_CTD_Color"] = Program_Overview["SPI_CTD"].map(color_spi_cpi)
-Program_Overview["CPI_LSD_Color"] = Program_Overview["CPI_LSD"].map(color_spi_cpi)
-Program_Overview["CPI_CTD_Color"] = Program_Overview["CPI_CTD"].map(color_spi_cpi)
+# Date + numeric
+base["DATE"] = pd.to_datetime(base["DATE"], errors="coerce").dt.normalize()
+base["VAL"]  = pd.to_numeric(base["VAL"], errors="coerce")
 
-comment_overview = "Comments / Root Cause & Corrective Actions"
-Program_Overview[comment_overview] = ""
-Program_Overview = preserve_comments(OUTPUT_XLSX, "Program_Overview", Program_Overview, ["ProgramID"], comment_overview)
+# Minimal cost set normalize (won't redo your mapping unless needed)
+if COSTSET_NORMALIZE_MAP:
+    base["COST_SET"] = base["COST_SET"].replace(COSTSET_NORMALIZE_MAP)
 
-# -------------------------
-# PRODUCT TEAM SPI/CPI
-# -------------------------
-pt_skel = pt_keys.copy()
-pt = (pt_skel
-      .merge(lsd_pt, on=["PROGRAM","PRODUCT_TEAM"], how="left", suffixes=("","_LSD"))
-      .merge(ctd_pt, on=["PROGRAM","PRODUCT_TEAM"], how="left", suffixes=("_LSD","_CTD"))
-     )
+# Keep only relevant rows
+base = base[base["COST_SET"].isin(KEEP_COSTSETS)].copy()
+base = base.dropna(subset=["DATE","PROGRAM","PRODUCT_TEAM","COST_SET"])
 
-for cs in EVMS_SETS:
-    if f"{cs}_LSD" not in pt.columns: pt[f"{cs}_LSD"] = 0.0
-    if f"{cs}_CTD" not in pt.columns: pt[f"{cs}_CTD"] = 0.0
+print("TODAY:", TODAY.date())
+print("Rows in base:", len(base))
+print("Programs:", base["PROGRAM"].nunique(), "| Product Teams:", base["PRODUCT_TEAM"].nunique())
 
-pt[[f"{cs}_LSD" for cs in EVMS_SETS] + [f"{cs}_CTD" for cs in EVMS_SETS]] = \
-    pt[[f"{cs}_LSD" for cs in EVMS_SETS] + [f"{cs}_CTD" for cs in EVMS_SETS]].fillna(0.0)
+# ----------------------------
+# STEP 2) FIX LSD END DATE (PER GROUP): "LAST COMMON POSTED DATE"
+# ----------------------------
+need_for_spi_cpi = ["BCWS","BCWP","ACWP"]  # must exist for LSD to be meaningful
 
-pt["SPI_LSD"] = safe_div(pt["BCWP_LSD"], pt["BCWS_LSD"])
-pt["CPI_LSD"] = safe_div(pt["BCWP_LSD"], pt["ACWP_LSD"])
-pt["SPI_CTD"] = safe_div(pt["BCWP_CTD"], pt["BCWS_CTD"])
-pt["CPI_CTD"] = safe_div(pt["BCWP_CTD"], pt["ACWP_CTD"])
+mx = (base[base["COST_SET"].isin(need_for_spi_cpi)]
+      .groupby(["PROGRAM","PRODUCT_TEAM","COST_SET"])["DATE"]
+      .max()
+      .unstack("COST_SET")
+      .reset_index())
 
-for c in ["SPI_LSD","CPI_LSD","SPI_CTD","CPI_CTD"]:
-    pt[c] = pd.to_numeric(pt[c], errors="coerce").fillna(0.0)
+# Last Common Date (LCD) where all three exist (earliest of the max dates)
+mx["LCD_END"] = mx[need_for_spi_cpi].min(axis=1)
 
-ProductTeam_SPI_CPI = pt.rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"})[
-    ["ProgramID","Product Team","SPI_LSD","SPI_CTD","CPI_LSD","CPI_CTD"]
-].copy()
+# If a team is missing one costset entirely, LCD_END becomes NaT; handle later
+mx["LSD_END"] = mx["LCD_END"]
 
-ProductTeam_SPI_CPI["SPI_LSD_Color"] = ProductTeam_SPI_CPI["SPI_LSD"].map(color_spi_cpi)
-ProductTeam_SPI_CPI["SPI_CTD_Color"] = ProductTeam_SPI_CPI["SPI_CTD"].map(color_spi_cpi)
-ProductTeam_SPI_CPI["CPI_LSD_Color"] = ProductTeam_SPI_CPI["CPI_LSD"].map(color_spi_cpi)
-ProductTeam_SPI_CPI["CPI_CTD_Color"] = ProductTeam_SPI_CPI["CPI_CTD"].map(color_spi_cpi)
+# Standard rolling LSD window
+mx["LSD_START"] = mx["LSD_END"] - pd.to_timedelta(LSD_DAYS - 1, unit="D")
 
-ProductTeam_SPI_CPI["LSD_START"] = LSD_START
-ProductTeam_SPI_CPI["LSD_END"]   = LSD_END
-ProductTeam_SPI_CPI["AS_OF_DATE"] = AS_OF_DATE
-ProductTeam_SPI_CPI["PREV_DATE"] = PREV_DATE
+# We also define CTD cutoff as LCD_END so CTD doesn't run past earned/actual
+mx["CTD_END"] = mx["LCD_END"]
 
-comment_pt = "Cause & Corrective Actions"
-ProductTeam_SPI_CPI[comment_pt] = ""
-ProductTeam_SPI_CPI = preserve_comments(
-    OUTPUT_XLSX, "ProductTeam_SPI_CPI", ProductTeam_SPI_CPI,
-    ["ProgramID","Product Team"], comment_pt
-)
+# Merge back
+base2 = base.merge(mx[["PROGRAM","PRODUCT_TEAM","LSD_START","LSD_END","CTD_END"]],
+                   on=["PROGRAM","PRODUCT_TEAM"], how="left")
 
-# -------------------------
-# PRODUCT TEAM BAC/EAC/VAC (robust, KUW won’t be missing)
-# BAC = CTD BCWS (through LSD_END)  [consistent with your “hours” world]
-# EAC = CTD ACWP + CTD ETC
+# Filter windows
+lsd_df = base2[(base2["DATE"] >= base2["LSD_START"]) & (base2["DATE"] <= base2["LSD_END"])].copy()
+ctd_df = base2[base2["DATE"] <= base2["CTD_END"]].copy()
+
+print("LSD window days:", LSD_DAYS)
+print("Rows in LSD df:", len(lsd_df), "| Rows in CTD df:", len(ctd_df))
+
+# ----------------------------
+# STEP 3) AGGREGATION FUNCTION
+# ----------------------------
+def agg_costsets(df: pd.DataFrame, group_cols: list[str], suffix: str) -> pd.DataFrame:
+    g = (df.groupby(group_cols + ["COST_SET"])["VAL"]
+           .sum()
+           .unstack("COST_SET")
+           .reset_index())
+    for cs in KEEP_COSTSETS:
+        if cs not in g.columns:
+            g[cs] = 0.0
+
+    out = g[group_cols].copy()
+    out[f"BCWS_{suffix}"] = g["BCWS"]
+    out[f"BCWP_{suffix}"] = g["BCWP"]
+    out[f"ACWP_{suffix}"] = g["ACWP"]
+    out[f"ETC_{suffix}"]  = g["ETC"]
+    return out
+
+# ----------------------------
+# STEP 4) PRODUCT TEAM SPI/CPI (LSD + CTD)
+# ----------------------------
+pt_lsd = agg_costsets(lsd_df, ["PROGRAM","PRODUCT_TEAM"], "LSD")
+pt_ctd = agg_costsets(ctd_df, ["PROGRAM","PRODUCT_TEAM"], "CTD")
+
+pt = pt_lsd.merge(pt_ctd, on=["PROGRAM","PRODUCT_TEAM"], how="outer")
+
+# Data availability flags (avoid fake zeros)
+pt["DATA_OK_LSD"] = ((pt["BCWS_LSD"] > 0) & (pt["BCWP_LSD"] > 0)).astype(int)
+pt["DATA_OK_CTD"] = ((pt["BCWS_CTD"] > 0) & (pt["BCWP_CTD"] > 0)).astype(int)
+
+pt["SPI_LSD"] = np.where(pt["DATA_OK_LSD"]==1, _safe_div(pt["BCWP_LSD"], pt["BCWS_LSD"]), np.nan)
+pt["CPI_LSD"] = np.where(pt["DATA_OK_LSD"]==1, _safe_div(pt["BCWP_LSD"], pt["ACWP_LSD"]), np.nan)
+
+pt["SPI_CTD"] = np.where(pt["DATA_OK_CTD"]==1, _safe_div(pt["BCWP_CTD"], pt["BCWS_CTD"]), np.nan)
+pt["CPI_CTD"] = np.where(pt["DATA_OK_CTD"]==1, _safe_div(pt["BCWP_CTD"], pt["ACWP_CTD"]), np.nan)
+
+# Bring in LSD/CTD dates per team for auditing
+pt_dates = mx[["PROGRAM","PRODUCT_TEAM","LSD_START","LSD_END","CTD_END"]].copy()
+pt = pt.merge(pt_dates, on=["PROGRAM","PRODUCT_TEAM"], how="left")
+
+# Colors for PBI
+pt["SPI_LSD_Color"] = pt["SPI_LSD"].map(color_rule_spi_cpi)
+pt["SPI_CTD_Color"] = pt["SPI_CTD"].map(color_rule_spi_cpi)
+pt["CPI_LSD_Color"] = pt["CPI_LSD"].map(color_rule_spi_cpi)
+pt["CPI_CTD_Color"] = pt["CPI_CTD"].map(color_rule_spi_cpi)
+
+# Output shaping
+ProductTeam_SPI_CPI = pt.rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"})
+ProductTeam_SPI_CPI["Cause & Corrective Actions"] = ""
+
+ProductTeam_SPI_CPI = ProductTeam_SPI_CPI[[
+    "ProgramID","Product Team",
+    "SPI_LSD","SPI_CTD","CPI_LSD","CPI_CTD",
+    "SPI_LSD_Color","SPI_CTD_Color","CPI_LSD_Color","CPI_CTD_Color",
+    "LSD_START","LSD_END","CTD_END",
+    "DATA_OK_LSD","DATA_OK_CTD",
+    "Cause & Corrective Actions"
+]].sort_values(["ProgramID","Product Team"])
+
+# ----------------------------
+# STEP 5) PROGRAM OVERVIEW (aggregate across teams)
+# ----------------------------
+prog_lsd = agg_costsets(lsd_df, ["PROGRAM"], "LSD")
+prog_ctd = agg_costsets(ctd_df, ["PROGRAM"], "CTD")
+prog = prog_lsd.merge(prog_ctd, on=["PROGRAM"], how="outer")
+
+prog["DATA_OK_LSD"] = ((prog["BCWS_LSD"] > 0) & (prog["BCWP_LSD"] > 0)).astype(int)
+prog["DATA_OK_CTD"] = ((prog["BCWS_CTD"] > 0) & (prog["BCWP_CTD"] > 0)).astype(int)
+
+prog["SPI_LSD"] = np.where(prog["DATA_OK_LSD"]==1, _safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"]), np.nan)
+prog["CPI_LSD"] = np.where(prog["DATA_OK_LSD"]==1, _safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"]), np.nan)
+prog["SPI_CTD"] = np.where(prog["DATA_OK_CTD"]==1, _safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"]), np.nan)
+prog["CPI_CTD"] = np.where(prog["DATA_OK_CTD"]==1, _safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"]), np.nan)
+
+# Program LCD dates: take min across teams for that program (conservative)
+prog_dates = (mx.groupby("PROGRAM")[["LSD_START","LSD_END","CTD_END"]]
+                .min()
+                .reset_index())
+prog = prog.merge(prog_dates, on="PROGRAM", how="left")
+
+prog["SPI_LSD_Color"] = prog["SPI_LSD"].map(color_rule_spi_cpi)
+prog["SPI_CTD_Color"] = prog["SPI_CTD"].map(color_rule_spi_cpi)
+prog["CPI_LSD_Color"] = prog["CPI_LSD"].map(color_rule_spi_cpi)
+prog["CPI_CTD_Color"] = prog["CPI_CTD"].map(color_rule_spi_cpi)
+
+Program_Overview = prog.rename(columns={"PROGRAM":"ProgramID"})
+Program_Overview["Cause & Corrective Actions"] = ""
+
+Program_Overview = Program_Overview[[
+    "ProgramID",
+    "SPI_LSD","SPI_CTD","CPI_LSD","CPI_CTD",
+    "SPI_LSD_Color","SPI_CTD_Color","CPI_LSD_Color","CPI_CTD_Color",
+    "LSD_START","LSD_END","CTD_END",
+    "DATA_OK_LSD","DATA_OK_CTD",
+    "Cause & Corrective Actions"
+]].sort_values("ProgramID")
+
+# ----------------------------
+# STEP 6) BAC / EAC / VAC BY PRODUCT TEAM
+# Assumption: BAC = total BCWS (CTD to LCD_END), EAC = ACWP_CTD + ETC_CTD
 # VAC = BAC - EAC
-# -------------------------
-bac_eac = pt.rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"}).copy()
+# ----------------------------
+pt_bac = pt.copy()
+pt_bac["BAC"] = pt_bac["BCWS_CTD"]
+pt_bac["EAC"] = pt_bac["ACWP_CTD"] + pt_bac["ETC_CTD"]
+pt_bac["VAC"] = pt_bac["BAC"] - pt_bac["EAC"]
+pt_bac["VAC_PCT"] = _safe_div(pt_bac["VAC"], pt_bac["BAC"])
 
-bac_eac["BAC"] = bac_eac["BCWS_CTD"]
-bac_eac["EAC"] = bac_eac["ACWP_CTD"] + bac_eac["ETC_CTD"]
-bac_eac["VAC"] = bac_eac["BAC"] - bac_eac["EAC"]
-bac_eac["VAC_BAC"] = safe_div(bac_eac["VAC"], bac_eac["BAC"])
+pt_bac["VAC_Color"] = pt_bac["VAC_PCT"].map(color_rule_vac_pct)
 
-bac_eac["BAC"] = _to_num(bac_eac["BAC"]).fillna(0.0)
-bac_eac["EAC"] = _to_num(bac_eac["EAC"]).fillna(0.0)
-bac_eac["VAC"] = _to_num(bac_eac["VAC"]).fillna(0.0)
-bac_eac["VAC_BAC"] = _to_num(bac_eac["VAC_BAC"]).fillna(0.0)
+ProductTeam_BAC_EAC_VAC = pt_bac.rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"})
+ProductTeam_BAC_EAC_VAC["Corrective Actions"] = ""
 
-bac_eac["VAC_Color"] = bac_eac["VAC_BAC"].map(color_vac_over_bac)
+ProductTeam_BAC_EAC_VAC = ProductTeam_BAC_EAC_VAC[[
+    "ProgramID","Product Team",
+    "BAC","EAC","VAC","VAC_PCT","VAC_Color",
+    "CTD_END",
+    "Corrective Actions"
+]].sort_values(["ProgramID","Product Team"])
 
-ProductTeam_BAC_EAC_VAC = bac_eac[
-    ["ProgramID","Product Team","BAC","EAC","VAC","VAC_BAC","VAC_Color"]
-].copy()
-ProductTeam_BAC_EAC_VAC[comment_pt] = ""
-ProductTeam_BAC_EAC_VAC = preserve_comments(
-    OUTPUT_XLSX, "ProductTeam_BAC_EAC_VAC", ProductTeam_BAC_EAC_VAC,
-    ["ProgramID","Product Team"], comment_pt
-)
+# ----------------------------
+# STEP 7) PROGRAM MANPOWER
+# Demand/Actual Hours = BCWS/ACWP in LSD window
+# Next Month BCWS/ETC = sum in next 28 days after LSD_END (standard, consistent)
+# ----------------------------
+# LSD window sums already available in prog_lsd
+pm = prog_lsd.rename(columns={"PROGRAM":"ProgramID"})
+pm["Demand Hours"] = pm["BCWS_LSD"]
+pm["Actual Hours"] = pm["ACWP_LSD"]
+pm["%Var"] = _safe_div(pm["Actual Hours"] - pm["Demand Hours"], pm["Demand Hours"])
+pm["%Var_Col"] = pm["%Var"].map(color_rule_vac_pct)
 
-# -------------------------
-# PROGRAM MANPOWER (guarantee Next Mo columns exist)
-# Demand Hours = CTD BCWS
-# Actual Hours = CTD ACWP
-# % Var = Actual / Demand * 100
-# -------------------------
-man = prog_skel.merge(ctd_prog, on="PROGRAM", how="left").copy()
-for cs in EVMS_SETS:
-    if cs not in man.columns: man[cs] = 0.0
-man[EVMS_SETS] = man[EVMS_SETS].fillna(0.0)
+# Build next-window frame
+# Next period is (LSD_END+1) to (LSD_END + 28)
+prog_lsd_end = prog_dates.rename(columns={"PROGRAM":"ProgramID"})
+prog_lsd_end["NEXT_START"] = prog_lsd_end["LSD_END"] + pd.to_timedelta(1, unit="D")
+prog_lsd_end["NEXT_END"]   = prog_lsd_end["LSD_END"] + pd.to_timedelta(LSD_DAYS, unit="D")
 
-man = man.rename(columns={"PROGRAM":"ProgramID"})
-man["Demand Hours"] = _to_num(man["BCWS"]).fillna(0.0)
-man["Actual Hours"] = _to_num(man["ACWP"]).fillna(0.0)
+base_prog = base.merge(prog_lsd_end[["ProgramID","NEXT_START","NEXT_END"]], left_on="PROGRAM", right_on="ProgramID", how="left")
+next_df = base_prog[(base_prog["DATE"] >= base_prog["NEXT_START"]) & (base_prog["DATE"] <= base_prog["NEXT_END"])].copy()
 
-man["% Var"] = safe_div(man["Actual Hours"], man["Demand Hours"]) * 100.0
-man["% Var"] = _to_num(man["% Var"]).fillna(0.0)
-man["% Var Color"] = man["% Var"].map(color_manpower_pct)
+next_prog = (next_df.groupby(["ProgramID","COST_SET"])["VAL"].sum().unstack("COST_SET").reset_index())
+for cs in KEEP_COSTSETS:
+    if cs not in next_prog.columns:
+        next_prog[cs] = 0.0
 
-# attach next 4 weeks
-Program_Manpower = man.merge(
-    next_prog.rename(columns={"PROGRAM":"ProgramID"}),
-    on="ProgramID", how="left"
-)
+next_prog = next_prog.rename(columns={"BCWS":"Next Mo BCWS Hrs", "ETC":"Next Mo ETC Hrs"})
+next_prog = next_prog[["ProgramID","Next Mo BCWS Hrs","Next Mo ETC Hrs"]]
 
-# force columns to exist + no NaN
-if "Next Mo BCWS Hours" not in Program_Manpower.columns:
-    Program_Manpower["Next Mo BCWS Hours"] = 0.0
-if "Next Mo ETC Hours" not in Program_Manpower.columns:
-    Program_Manpower["Next Mo ETC Hours"] = 0.0
+Program_Manpower = pm.merge(next_prog, on="ProgramID", how="left")
+Program_Manpower = Program_Manpower.merge(prog_dates.rename(columns={"PROGRAM":"ProgramID"}), on="ProgramID", how="left")
 
-Program_Manpower["Next Mo BCWS Hours"] = _to_num(Program_Manpower["Next Mo BCWS Hours"]).fillna(0.0)
-Program_Manpower["Next Mo ETC Hours"]  = _to_num(Program_Manpower["Next Mo ETC Hours"]).fillna(0.0)
+Program_Manpower = Program_Manpower[[
+    "ProgramID",
+    "Demand Hours","Actual Hours","%Var","%Var_Col",
+    "Next Mo BCWS Hrs","Next Mo ETC Hrs",
+    "LSD_START","LSD_END","CTD_END"
+]].sort_values("ProgramID")
 
-Program_Manpower["AS_OF_DATE"] = AS_OF_DATE
-Program_Manpower["LSD_START"] = LSD_START
-Program_Manpower["LSD_END"] = LSD_END
-
-Program_Manpower[comment_pt] = ""
-Program_Manpower = preserve_comments(
-    OUTPUT_XLSX, "Program_Manpower", Program_Manpower,
-    ["ProgramID"], comment_pt
-)
-
-Program_Manpower = Program_Manpower[
-    ["ProgramID","Demand Hours","Actual Hours","% Var","% Var Color",
-     "Next Mo BCWS Hours","Next Mo ETC Hours","AS_OF_DATE","LSD_START","LSD_END",comment_pt]
-].copy()
-
-# -------------------------
-# WRITE EXCEL
-# -------------------------
+# ----------------------------
+# STEP 8) WRITE EXCEL
+# ----------------------------
 with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
     Program_Overview.to_excel(writer, sheet_name="Program_Overview", index=False)
     ProductTeam_SPI_CPI.to_excel(writer, sheet_name="ProductTeam_SPI_CPI", index=False)
     ProductTeam_BAC_EAC_VAC.to_excel(writer, sheet_name="ProductTeam_BAC_EAC_VAC", index=False)
     Program_Manpower.to_excel(writer, sheet_name="Program_Manpower", index=False)
 
-print(f"\nSaved: {OUTPUT_XLSX.resolve()}")
+print("Saved:", str(OUTPUT_XLSX))
 
-print("""
-Power BI formatting (OVERVIEW wide):
-- Visual: Table
-- Fields: ProgramID, SPI_LSD, SPI_CTD, CPI_LSD, CPI_CTD
-- Conditional formatting -> Background color -> Format by: Field value
-    SPI_LSD uses SPI_LSD_Color
-    SPI_CTD uses SPI_CTD_Color
-    CPI_LSD uses CPI_LSD_Color
-    CPI_CTD uses CPI_CTD_Color
-""")
+# ----------------------------
+# STEP 9) QUICK SANITY CHECKS (prints)
+# ----------------------------
+# Find any teams where SPI_LSD is NaN due to missing cost sets in LSD window
+bad_lsd = ProductTeam_SPI_CPI[ProductTeam_SPI_CPI["DATA_OK_LSD"] == 0][["ProgramID","Product Team","LSD_START","LSD_END","DATA_OK_LSD"]]
+if len(bad_lsd):
+    print("\nTeams missing LSD data (BCWS/BCWP not both present in window) - should be rare after LCD fix:")
+    print(bad_lsd.head(25).to_string(index=False))
+
+# If you want to debug a specific team quickly:
+# p, t = "ABRAMS STS 2022", "KUW"
+# tmp = lsd_df[(lsd_df["PROGRAM"]==p) & (lsd_df["PRODUCT_TEAM"]==t)]
+# print("\nLSD sums:", p, t)
+# print(tmp.groupby("COST_SET")["VAL"].sum())
