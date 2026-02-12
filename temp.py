@@ -1,12 +1,10 @@
 # ============================================================
 # EVMS -> PowerBI Excel Export (ONE CELL)
-# MUST START FROM: cobra_merged_df (your cleaned LONG dataset)
+# START FROM: cobra_merged_df (cleaned LONG dataset)
 #
-# Fixes:
-# - NO PROGRAM FILTERING (per request)
-# - LSD uses a STATUS WINDOW (default: last 2 distinct dates)
-#   so BCWS/BCWP/ACWP are aligned and SPI_LSD doesn't blow up.
-# - Program_Overview is WIDE (SPI/CPI as separate columns)
+# No program filtering.
+# No cost-set remapping (assumes COST_SET already: BCWS/BCWP/ACWP/ETC).
+# LSD uses LAST N DISTINCT DATES (status window) so SPI_LSD isn't inflated.
 #
 # Output sheets (NAMES LOCKED):
 #   Program_Overview
@@ -17,37 +15,34 @@
 
 import re
 from pathlib import Path
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
 
 # -------------------------
-# SETTINGS (edit if needed)
+# SETTINGS
 # -------------------------
 OUTPUT_XLSX = Path("EVMS_PowerBI_Input.xlsx")
+TODAY_OVERRIDE = None            # e.g. "2026-02-12"
+STATUS_DATES_IN_WINDOW = 2       # <-- LSD window length in DISTINCT dates (typically 2 for "two weeks")
+NEXT_WINDOW_DATES = 2            # for "Next Mo" fields: next N distinct dates after LSD_END
 
-TODAY_OVERRIDE = None          # e.g. "2026-02-12"
-STATUS_DATES_IN_WINDOW = 2     # <-- key fix: use last 2 DISTINCT dates for LSD window
-NEXT_WINDOW_DATES = 2          # for "Next Mo" (use next 2 distinct dates after LSD)
-REQUIRE_COSTSETS = ["BCWS","BCWP","ACWP","ETC"]  # EVMS cost sets assumed already mapped upstream
+EVMS_COSTSETS = ["BCWS","BCWP","ACWP","ETC"]
 
 # -------------------------
-# PPT COLORS (hex)
+# COLORS (hex)
 # -------------------------
-CLR_LIGHT_BLUE = "#8EB4E3"  # >= 1.05
-CLR_GREEN      = "#339966"  # 0.98–1.05
-CLR_YELLOW     = "#FFFF99"  # 0.95–0.98
-CLR_RED        = "#C0504D"  # < 0.95
+CLR_LIGHT_BLUE = "#8EB4E3"
+CLR_GREEN      = "#339966"
+CLR_YELLOW     = "#FFFF99"
+CLR_RED        = "#C0504D"
 
-def _to_num(x):
-    return pd.to_numeric(x, errors="coerce")
+def _to_num(x): return pd.to_numeric(x, errors="coerce")
 
 def safe_div(a, b):
-    a = _to_num(a)
-    b = _to_num(b)
+    a = _to_num(a); b = _to_num(b)
     return np.where((b == 0) | pd.isna(b), np.nan, a / b)
 
-# SPI/CPI thresholds
 def color_spi_cpi(x):
     x = _to_num(x)
     if pd.isna(x): return None
@@ -56,7 +51,6 @@ def color_spi_cpi(x):
     if x >= 0.95: return CLR_YELLOW
     return CLR_RED
 
-# VAC/BAC thresholds
 def color_vac_over_bac(x):
     x = _to_num(x)
     if pd.isna(x): return None
@@ -65,7 +59,6 @@ def color_vac_over_bac(x):
     if x >= -0.055: return CLR_YELLOW
     return CLR_RED
 
-# Manpower %Var thresholds
 def color_manpower_pct(pct):
     pct = _to_num(pct)
     if pd.isna(pct): return None
@@ -82,7 +75,7 @@ def as_date(x):
     return pd.to_datetime(x, errors="coerce").date()
 
 # -------------------------
-# COMMENTS PRESERVATION
+# Comments preservation
 # -------------------------
 def preserve_comments(existing_path: Path, sheet: str, df_new: pd.DataFrame, key_cols, comment_col):
     if (not existing_path.exists()) or (comment_col not in df_new.columns):
@@ -107,7 +100,7 @@ def preserve_comments(existing_path: Path, sheet: str, df_new: pd.DataFrame, key
     return out
 
 # -------------------------
-# COERCE INPUT (minimal; do NOT remap cost sets)
+# Coerce input (minimal; NO cost-set remap)
 # -------------------------
 def clean_colname(c):
     return re.sub(r"[^A-Z0-9_]+", "_", str(c).strip().upper().replace(" ", "_").replace("-", "_"))
@@ -116,7 +109,7 @@ def coerce_long(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df_in.copy()
     df.columns = [clean_colname(c) for c in df.columns]
 
-    # Accept common variants without "assumptions"
+    # allow common name variants (not assumptions about meaning, just aliases)
     rename = {}
     if "PROGRAMID" in df.columns and "PROGRAM" not in df.columns: rename["PROGRAMID"] = "PROGRAM"
     if "SUB_TEAM" in df.columns and "PRODUCT_TEAM" not in df.columns: rename["SUB_TEAM"] = "PRODUCT_TEAM"
@@ -128,15 +121,11 @@ def coerce_long(df_in: pd.DataFrame) -> pd.DataFrame:
     required = ["PROGRAM","PRODUCT_TEAM","DATE","COST_SET","HOURS"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(
-            f"cobra_merged_df missing required columns: {missing}\n"
-            f"Found columns: {list(df.columns)}"
-        )
+        raise ValueError(f"cobra_merged_df missing columns: {missing}\nFound: {list(df.columns)}")
 
     df["DATE"] = pd.to_datetime(df["DATE"], errors="coerce").dt.date
     df["HOURS"] = pd.to_numeric(df["HOURS"], errors="coerce")
 
-    # Keep names as-is except trimming whitespace (you said cleansing already done)
     df["PROGRAM"] = df["PROGRAM"].astype(str).str.strip()
     df["PRODUCT_TEAM"] = df["PRODUCT_TEAM"].astype(str).str.strip()
     df["COST_SET"] = df["COST_SET"].astype(str).str.strip().str.upper()
@@ -144,81 +133,77 @@ def coerce_long(df_in: pd.DataFrame) -> pd.DataFrame:
     df = df.dropna(subset=["PROGRAM","PRODUCT_TEAM","DATE","COST_SET","HOURS"])
     return df
 
+# -------------------------
+# Aggregation helpers
+# -------------------------
+def agg_pivot(df, idx_cols):
+    """
+    Returns a wide table with columns:
+      idx_cols + [BCWS, BCWP, ACWP, ETC]  (missing filled with NaN)
+    """
+    g = df.groupby(idx_cols + ["COST_SET"], as_index=False)["HOURS"].sum()
+    pv = g.pivot_table(index=idx_cols, columns="COST_SET", values="HOURS", aggfunc="sum").reset_index()
+    for cs in EVMS_COSTSETS:
+        if cs not in pv.columns:
+            pv[cs] = np.nan
+    return pv
+
+def ensure_cols(df, cols):
+    for c in cols:
+        if c not in df.columns:
+            df[c] = np.nan
+    return df
+
 # ============================================================
-# START: cobra_merged_df ONLY
+# START: cobra_merged_df
 # ============================================================
 if "cobra_merged_df" not in globals() or not isinstance(cobra_merged_df, pd.DataFrame) or len(cobra_merged_df) == 0:
-    raise ValueError("cobra_merged_df is not defined or is empty. Put your cleaned long Cobra data into cobra_merged_df first.")
+    raise ValueError("cobra_merged_df is not defined or empty.")
 
 base = coerce_long(cobra_merged_df)
 
 today = as_date(TODAY_OVERRIDE) if TODAY_OVERRIDE else date.today()
 
-# Keep only EVMS sets we need (no remapping)
-evms = base[base["COST_SET"].isin(REQUIRE_COSTSETS)].copy()
+# only keep EVMS cost sets (no remap)
+evms = base[base["COST_SET"].isin(EVMS_COSTSETS)].copy()
 
 print("TODAY:", today)
 print("Rows in cobra_merged_df:", len(base))
 print("Rows in EVMS (BCWS/BCWP/ACWP/ETC):", len(evms))
 print("Programs:", evms["PROGRAM"].nunique(), "| Product Teams:", evms["PRODUCT_TEAM"].nunique())
 
-# -------------------------
-# GLOBAL LSD END = max date in data <= today
-# -------------------------
+# LSD_END = max date in data <= today
 dates_le_today = sorted(d for d in evms["DATE"].unique() if d <= today)
 if not dates_le_today:
     raise ValueError("No EVMS rows found with DATE <= today. Check DATE parsing or TODAY_OVERRIDE.")
+
 LSD_END = dates_le_today[-1]
-
-# LSD window uses last N distinct dates ending at LSD_END
-if len(dates_le_today) < STATUS_DATES_IN_WINDOW:
-    lsd_dates = dates_le_today
-else:
-    lsd_dates = dates_le_today[-STATUS_DATES_IN_WINDOW:]
-
+lsd_dates = dates_le_today[-STATUS_DATES_IN_WINDOW:] if len(dates_le_today) >= STATUS_DATES_IN_WINDOW else dates_le_today
 PREV_DATE = lsd_dates[0] if len(lsd_dates) > 1 else None
 
 print("LSD_END (max DATE <= today):", LSD_END)
-print("LSD window dates (used for LSD metrics):", lsd_dates)
+print("LSD window dates:", lsd_dates)
 print("PREV_DATE:", PREV_DATE)
 
-# -------------------------
-# CTD: cumulative up to LSD_END
-# LSD: sum over LSD window dates
-# -------------------------
+# CTD window: <= LSD_END
 ctd = evms[evms["DATE"] <= LSD_END].copy()
+# LSD window: last N dates
 lsd = evms[evms["DATE"].isin(lsd_dates)].copy()
 
-# helper: aggregate to program or program+pt, then pivot cost sets
-def agg_pivot(df, idx_cols, value_name):
-    g = (df.groupby(idx_cols + ["COST_SET"], as_index=False)["HOURS"].sum()
-           .rename(columns={"HOURS": value_name}))
-    pv = g.pivot_table(index=idx_cols, columns="COST_SET", values=value_name, aggfunc="sum").reset_index()
-    for cs in REQUIRE_COSTSETS:
-        if cs not in pv.columns:
-            pv[cs] = np.nan
-    return pv
-
-ctd_prog = agg_pivot(ctd, ["PROGRAM"], "CTD_HRS")
-lsd_prog = agg_pivot(lsd, ["PROGRAM"], "LSD_HRS")
-
-ctd_pt = agg_pivot(ctd, ["PROGRAM","PRODUCT_TEAM"], "CTD_HRS")
-lsd_pt = agg_pivot(lsd, ["PROGRAM","PRODUCT_TEAM"], "LSD_HRS")
-
 # ============================================================
-# PROGRAM OVERVIEW (WIDE like your screenshot)
-# Columns: ProgramID | SPI_LSD | SPI_CTD | CPI_LSD | CPI_CTD | *_Color | LSD_DATE | PREV_DATE | AS_OF_DATE
+# PROGRAM OVERVIEW (WIDE)
 # ============================================================
-prog = ctd_prog.merge(lsd_prog, on=["PROGRAM"], how="outer", suffixes=("_CTD","_LSD")).copy()
-prog = prog.rename(columns={"PROGRAM":"ProgramID"})
+ctd_prog = agg_pivot(ctd, ["PROGRAM"]).rename(columns={"PROGRAM":"ProgramID"})
+lsd_prog = agg_pivot(lsd, ["PROGRAM"]).rename(columns={"PROGRAM":"ProgramID"})
 
-# CTD ratios (cumulative)
-prog["SPI_CTD"] = safe_div(prog["BCWP_CTD_HRS"], prog["BCWS_CTD_HRS"])
-prog["CPI_CTD"] = safe_div(prog["BCWP_CTD_HRS"], prog["ACWP_CTD_HRS"])
+prog = ctd_prog.merge(lsd_prog, on="ProgramID", how="outer", suffixes=("_CTD","_LSD"))
+prog = ensure_cols(prog, ["BCWS_CTD","BCWP_CTD","ACWP_CTD","ETC_CTD","BCWS_LSD","BCWP_LSD","ACWP_LSD","ETC_LSD"])
 
-# LSD ratios (status window)
-prog["SPI_LSD"] = safe_div(prog["BCWP_LSD_HRS"], prog["BCWS_LSD_HRS"])
-prog["CPI_LSD"] = safe_div(prog["BCWP_LSD_HRS"], prog["ACWP_LSD_HRS"])
+# Ratios
+prog["SPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["BCWS_CTD"])
+prog["CPI_CTD"] = safe_div(prog["BCWP_CTD"], prog["ACWP_CTD"])
+prog["SPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["BCWS_LSD"])
+prog["CPI_LSD"] = safe_div(prog["BCWP_LSD"], prog["ACWP_LSD"])
 
 # Colors
 prog["SPI_LSD_Color"] = prog["SPI_LSD"].map(color_spi_cpi)
@@ -226,7 +211,7 @@ prog["SPI_CTD_Color"] = prog["SPI_CTD"].map(color_spi_cpi)
 prog["CPI_LSD_Color"] = prog["CPI_LSD"].map(color_spi_cpi)
 prog["CPI_CTD_Color"] = prog["CPI_CTD"].map(color_spi_cpi)
 
-# Date fields (these were missing / inconsistent before)
+# Dates
 prog["LSD_DATE"] = LSD_END
 prog["PREV_DATE"] = PREV_DATE
 prog["AS_OF_DATE"] = LSD_END
@@ -241,21 +226,21 @@ Program_Overview = prog[
      comment_overview]
 ].sort_values("ProgramID").reset_index(drop=True)
 
-Program_Overview = preserve_comments(
-    OUTPUT_XLSX, "Program_Overview", Program_Overview,
-    ["ProgramID"], comment_overview
-)
+Program_Overview = preserve_comments(OUTPUT_XLSX, "Program_Overview", Program_Overview, ["ProgramID"], comment_overview)
 
 # ============================================================
 # PRODUCT TEAM SPI/CPI
 # ============================================================
-pt = ctd_pt.merge(lsd_pt, on=["PROGRAM","PRODUCT_TEAM"], how="outer", suffixes=("_CTD","_LSD")).copy()
-pt = pt.rename(columns={"PROGRAM":"ProgramID", "PRODUCT_TEAM":"Product Team"})
+ctd_pt = agg_pivot(ctd, ["PROGRAM","PRODUCT_TEAM"]).rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"})
+lsd_pt = agg_pivot(lsd, ["PROGRAM","PRODUCT_TEAM"]).rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"})
 
-pt["SPI_CTD"] = safe_div(pt["BCWP_CTD_HRS"], pt["BCWS_CTD_HRS"])
-pt["CPI_CTD"] = safe_div(pt["BCWP_CTD_HRS"], pt["ACWP_CTD_HRS"])
-pt["SPI_LSD"] = safe_div(pt["BCWP_LSD_HRS"], pt["BCWS_LSD_HRS"])
-pt["CPI_LSD"] = safe_div(pt["BCWP_LSD_HRS"], pt["ACWP_LSD_HRS"])
+pt = ctd_pt.merge(lsd_pt, on=["ProgramID","Product Team"], how="outer", suffixes=("_CTD","_LSD"))
+pt = ensure_cols(pt, ["BCWS_CTD","BCWP_CTD","ACWP_CTD","ETC_CTD","BCWS_LSD","BCWP_LSD","ACWP_LSD","ETC_LSD"])
+
+pt["SPI_CTD"] = safe_div(pt["BCWP_CTD"], pt["BCWS_CTD"])
+pt["CPI_CTD"] = safe_div(pt["BCWP_CTD"], pt["ACWP_CTD"])
+pt["SPI_LSD"] = safe_div(pt["BCWP_LSD"], pt["BCWS_LSD"])
+pt["CPI_LSD"] = safe_div(pt["BCWP_LSD"], pt["ACWP_LSD"])
 
 pt["SPI_LSD_Color"] = pt["SPI_LSD"].map(color_spi_cpi)
 pt["SPI_CTD_Color"] = pt["SPI_CTD"].map(color_spi_cpi)
@@ -277,44 +262,34 @@ ProductTeam_SPI_CPI = pt[
      comment_pt]
 ].sort_values(["ProgramID","Product Team"]).reset_index(drop=True)
 
-ProductTeam_SPI_CPI = preserve_comments(
-    OUTPUT_XLSX, "ProductTeam_SPI_CPI", ProductTeam_SPI_CPI,
-    ["ProgramID","Product Team"], comment_pt
-)
+ProductTeam_SPI_CPI = preserve_comments(OUTPUT_XLSX, "ProductTeam_SPI_CPI", ProductTeam_SPI_CPI, ["ProgramID","Product Team"], comment_pt)
 
 # ============================================================
 # PRODUCT TEAM BAC/EAC/VAC
-# BAC = sum(BCWS) for the fiscal year in data (year of LSD_END)
+# BAC = sum(BCWS) for calendar year of LSD_END (adjust if your fiscal year differs)
 # EAC = ACWP_CTD + ETC_CTD
 # VAC = BAC - EAC
-# Color based on VAC/BAC
 # ============================================================
 year_start = date(LSD_END.year, 1, 1)
 year_end   = date(LSD_END.year, 12, 31)
 
 year_df = evms[(evms["DATE"] >= year_start) & (evms["DATE"] <= year_end)].copy()
-
 bac = (year_df[year_df["COST_SET"] == "BCWS"]
        .groupby(["PROGRAM","PRODUCT_TEAM"], as_index=False)["HOURS"].sum()
-       .rename(columns={"HOURS":"BAC"}))
+       .rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team","HOURS":"BAC"}))
 
-# CTD components come from ctd_pt pivot (already cumulative up to LSD_END)
-ctd_pt_simple = agg_pivot(ctd, ["PROGRAM","PRODUCT_TEAM"], "CTD_HRS")
-ctd_pt_simple = ctd_pt_simple.rename(columns={
-    "PROGRAM":"ProgramID",
-    "PRODUCT_TEAM":"Product Team",
-    "ACWP":"ACWP_CTD",
-    "ETC":"ETC_CTD"
-})
+# CTD ACWP/ETC for EAC
+ctd_pt_for_eac = ctd_pt.copy()
+ctd_pt_for_eac = ensure_cols(ctd_pt_for_eac, ["ACWP","ETC"])
+ctd_pt_for_eac = ctd_pt_for_eac.rename(columns={"ACWP":"ACWP_CTD","ETC":"ETC_CTD"})
 
-tmp = bac.rename(columns={"PROGRAM":"ProgramID","PRODUCT_TEAM":"Product Team"}).merge(
-    ctd_pt_simple[["ProgramID","Product Team","ACWP_CTD","ETC_CTD"]],
-    on=["ProgramID","Product Team"], how="outer"
-)
+tmp = bac.merge(ctd_pt_for_eac[["ProgramID","Product Team","ACWP_CTD","ETC_CTD"]],
+                on=["ProgramID","Product Team"], how="outer")
 
 tmp["BAC"] = _to_num(tmp["BAC"])
 tmp["ACWP_CTD"] = _to_num(tmp["ACWP_CTD"]).fillna(0.0)
 tmp["ETC_CTD"]  = _to_num(tmp["ETC_CTD"]).fillna(0.0)
+
 tmp["EAC"] = tmp["ACWP_CTD"] + tmp["ETC_CTD"]
 tmp["VAC"] = tmp["BAC"] - tmp["EAC"]
 tmp["VAC_BAC"] = safe_div(tmp["VAC"], tmp["BAC"])
@@ -326,40 +301,33 @@ ProductTeam_BAC_EAC_VAC = tmp[
     ["ProgramID","Product Team","BAC","EAC","VAC","VAC_BAC","VAC_Color",comment_pt]
 ].sort_values(["ProgramID","Product Team"]).reset_index(drop=True)
 
-ProductTeam_BAC_EAC_VAC = preserve_comments(
-    OUTPUT_XLSX, "ProductTeam_BAC_EAC_VAC", ProductTeam_BAC_EAC_VAC,
-    ["ProgramID","Product Team"], comment_pt
-)
+ProductTeam_BAC_EAC_VAC = preserve_comments(OUTPUT_XLSX, "ProductTeam_BAC_EAC_VAC", ProductTeam_BAC_EAC_VAC, ["ProgramID","Product Team"], comment_pt)
 
 # ============================================================
 # PROGRAM MANPOWER
-# Demand Hours = BCWS_CTD
-# Actual Hours = ACWP_CTD
+# Demand Hours = BCWS_CTD (cumulative)
+# Actual Hours = ACWP_CTD (cumulative)
 # % Var = Actual / Demand * 100
-# Next Mo: use next N distinct dates after LSD_END (simple + consistent)
+# Next Mo fields = next N distinct dates after LSD_END (simple and consistent)
 # ============================================================
-man_src = ctd_prog.copy()
-man_src = man_src.rename(columns={"PROGRAM":"ProgramID"})
-
-# In man_src, CTD_HRS pivot produced columns BCWS, ACWP, etc? Actually agg_pivot names are BCWS,BCWP,ACWP,ETC but values are CTD_HRS
-# Because of pivot_table values column name, the columns are cost set names directly.
 man = pd.DataFrame({
-    "ProgramID": man_src["ProgramID"],
-    "Demand Hours": _to_num(man_src.get("BCWS")),
-    "Actual Hours": _to_num(man_src.get("ACWP")),
+    "ProgramID": ctd_prog["ProgramID"],
+    "Demand Hours": _to_num(ctd_prog.get("BCWS")),
+    "Actual Hours": _to_num(ctd_prog.get("ACWP")),
 })
 man["% Var"] = safe_div(man["Actual Hours"], man["Demand Hours"]) * 100.0
 man["% Var Color"] = man["% Var"].map(color_manpower_pct)
 
-# Next window: next N distinct dates after LSD_END
 dates_gt = sorted(d for d in evms["DATE"].unique() if d > LSD_END)
 next_dates = dates_gt[:NEXT_WINDOW_DATES] if dates_gt else []
-next_df = evms[(evms["DATE"].isin(next_dates)) & (evms["COST_SET"].isin(["BCWS","ETC"]))].copy()
 
-next_prog = (next_df.groupby(["PROGRAM","COST_SET"], as_index=False)["HOURS"].sum()
-                 .pivot_table(index="PROGRAM", columns="COST_SET", values="HOURS", aggfunc="sum")
-                 .reset_index()
-            ) if len(next_df) else pd.DataFrame({"PROGRAM": evms["PROGRAM"].unique()})
+next_df = evms[(evms["DATE"].isin(next_dates)) & (evms["COST_SET"].isin(["BCWS","ETC"]))].copy()
+if len(next_df):
+    next_prog = (next_df.groupby(["PROGRAM","COST_SET"], as_index=False)["HOURS"].sum()
+                    .pivot_table(index="PROGRAM", columns="COST_SET", values="HOURS", aggfunc="sum")
+                    .reset_index())
+else:
+    next_prog = pd.DataFrame({"PROGRAM": evms["PROGRAM"].unique()})
 
 if "BCWS" not in next_prog.columns: next_prog["BCWS"] = np.nan
 if "ETC"  not in next_prog.columns: next_prog["ETC"]  = np.nan
@@ -370,38 +338,30 @@ next_prog = next_prog.rename(columns={
     "ETC":"Next Mo ETC Hours"
 })
 
-Program_Manpower = man.merge(
-    next_prog[["ProgramID","Next Mo BCWS Hours","Next Mo ETC Hours"]],
-    on="ProgramID", how="left"
-)
+Program_Manpower = man.merge(next_prog[["ProgramID","Next Mo BCWS Hours","Next Mo ETC Hours"]],
+                             on="ProgramID", how="left")
 
 Program_Manpower[comment_pt] = ""
 Program_Manpower = Program_Manpower[
     ["ProgramID","Demand Hours","Actual Hours","% Var","% Var Color","Next Mo BCWS Hours","Next Mo ETC Hours",comment_pt]
 ].sort_values("ProgramID").reset_index(drop=True)
 
-Program_Manpower = preserve_comments(
-    OUTPUT_XLSX, "Program_Manpower", Program_Manpower,
-    ["ProgramID"], comment_pt
-)
+Program_Manpower = preserve_comments(OUTPUT_XLSX, "Program_Manpower", Program_Manpower, ["ProgramID"], comment_pt)
 
 # ============================================================
-# QUICK DIAGNOSTICS (why values were missing)
+# Diagnostics to explain "missing data"
 # ============================================================
 print("\n--- Diagnostics ---")
-print("Programs with missing SPI_CTD:", Program_Overview["SPI_CTD"].isna().sum())
-print("Programs with missing SPI_LSD:", Program_Overview["SPI_LSD"].isna().sum())
-print("If SPI_LSD is NaN, it usually means BCWS_LSD window sum is 0 or missing for that program.\n")
+print("Program_Overview missing SPI_LSD:", Program_Overview["SPI_LSD"].isna().sum())
+print("Program_Overview missing SPI_CTD:", Program_Overview["SPI_CTD"].isna().sum())
+print("If SPI_LSD is NaN, BCWS_LSD is 0/missing for that ProgramID in the LSD window.\n")
 
-# Example check: show programs where BCWS_LSD is null/0
-prog_check = prog.copy()
-prog_check["BCWS_LSD_SUM"] = _to_num(prog_check["BCWS_LSD_HRS"])
-bad = prog_check[(prog_check["BCWS_LSD_SUM"].isna()) | (prog_check["BCWS_LSD_SUM"] == 0)][["ProgramID","BCWS_LSD_HRS","BCWP_LSD_HRS","ACWP_LSD_HRS"]]
-print("Programs with BCWS_LSD window sum missing/0 (will break SPI_LSD):")
-print(bad.head(25) if len(bad) else "None")
+bad_spi_lsd = prog[( _to_num(prog["BCWS_LSD"]).isna() ) | (_to_num(prog["BCWS_LSD"]) == 0)][["ProgramID","BCWS_LSD","BCWP_LSD","ACWP_LSD"]]
+print("Programs with BCWS_LSD missing/0 (SPI_LSD will be blank):")
+print(bad_spi_lsd.head(50) if len(bad_spi_lsd) else "None")
 
 # ============================================================
-# WRITE EXCEL (sheet order matters)
+# Write Excel
 # ============================================================
 with pd.ExcelWriter(OUTPUT_XLSX, engine="openpyxl") as writer:
     Program_Overview.to_excel(writer, sheet_name="Program_Overview", index=False)
